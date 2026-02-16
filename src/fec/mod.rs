@@ -1,6 +1,6 @@
 //! Forward Error Correction (FEC) module
 //!
-//! Provides turbo coding, convolutional coding, interleaving, and compression
+//! Provides LDPC coding, turbo coding, convolutional coding, interleaving, and compression
 //! for reliable data transmission over noisy channels.
 
 mod convolutional;
@@ -8,10 +8,14 @@ mod turbo;
 mod interleaver;
 mod huffman;
 pub mod crc;
+pub mod ldpc_matrices;
+mod ldpc;
 
 #[allow(unused_imports)]
 pub use convolutional::{ConvolutionalEncoder, ViterbiDecoder, K7ConvolutionalEncoder, K7ViterbiDecoder};
+#[allow(unused_imports)]
 pub use turbo::{TurboEncoder, TurboDecoder};
+pub use ldpc::{LdpcEncoder, LdpcDecoder};
 #[allow(unused_imports)]
 pub use interleaver::{Interleaver, InterleaverType};
 #[allow(unused_imports)]
@@ -40,7 +44,8 @@ impl CodeRate {
         }
     }
 
-    /// Calculate output bits for given input bits
+    /// Calculate output bits for given input bits (Turbo codes)
+    /// Note: Turbo codes add 16 tail bits on top of this
     pub fn output_bits(&self, input_bits: usize) -> usize {
         match self {
             CodeRate::Rate1_2 => input_bits * 2,
@@ -49,6 +54,34 @@ impl CodeRate {
             CodeRate::Rate3_4 => (input_bits * 4 + 2) / 3,
             CodeRate::Rate5_6 => (input_bits * 6 + 4) / 5,
         }
+    }
+
+    /// Calculate LDPC output bits for given fec_block_bits
+    /// Returns same capacity as Turbo codes for compatibility with frame configs
+    /// (frame configs were designed around Turbo output sizes)
+    pub fn ldpc_output_bits(&self, fec_block_bits: usize) -> usize {
+        // Match Turbo output for frame compatibility
+        // Original Turbo: output_bits(block_size) + 16 tail bits
+        self.output_bits(fec_block_bits) + 16
+    }
+
+    /// Calculate number of LDPC codewords that fit in expected output capacity
+    pub fn ldpc_codeword_count(&self, fec_block_bits: usize) -> usize {
+        use crate::fec::ldpc_matrices::BLOCK_1944;
+
+        let expected_output = self.ldpc_output_bits(fec_block_bits);
+        // Number of codewords that FIT (floor division, not ceiling)
+        // Need at least 1 codeword even for very small inputs
+        (expected_output / BLOCK_1944).max(1)
+    }
+
+    /// Get info bits available with LDPC for given fec_block_bits
+    pub fn ldpc_info_capacity(&self, fec_block_bits: usize) -> usize {
+        use crate::fec::ldpc_matrices::{BLOCK_1944, info_bits};
+
+        let num_codewords = self.ldpc_codeword_count(fec_block_bits);
+        let k = info_bits(BLOCK_1944, *self);
+        num_codewords * k
     }
 
     /// Get code rate for a given speed level

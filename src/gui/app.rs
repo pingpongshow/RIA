@@ -596,18 +596,18 @@ impl eframe::App for RiaApp {
                 .collapsible(false)
                 .show(ctx, |ui| {
                     ui.vertical_centered(|ui| {
-                        ui.heading("RIA - OFDM HF Modem");
+                        ui.heading("RIA - AFDM HF Modem");
                         ui.add_space(8.0);
                         ui.label(format!("Version {}", env!("CARGO_PKG_VERSION")));
                         ui.add_space(8.0);
-                        ui.label("A high-performance OFDM modem for HF radio");
-                        ui.label("communications with turbo FEC coding.");
+                        ui.label("A high-performance AFDM modem for HF radio");
+                        ui.label("communications with LDPC FEC coding.");
                         ui.add_space(16.0);
                         ui.separator();
                         ui.add_space(8.0);
                         ui.label("Features:");
-                        ui.label("• OFDM modulation (500/2300/2750 Hz modes)");
-                        ui.label("• Turbo FEC with iterative decoding");
+                        ui.label("• AFDM modulation (500/2300/2750 Hz modes)");
+                        ui.label("• LDPC FEC (IEEE 802.11n QC-LDPC)");
                         ui.label("• Adaptive rate control");
                         ui.label("• ARQ protocol for reliable delivery");
                         ui.add_space(16.0);

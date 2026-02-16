@@ -1,7 +1,10 @@
-//! RIA - High-performance OFDM HF Modem Library
+//! RIA - High-performance AFDM HF Modem Library
 //!
-//! This library provides the core components for building an OFDM-based
-//! HF modem with turbo FEC coding and ARQ protocol support.
+//! This library provides the core components for building an AFDM-based
+//! HF modem with LDPC FEC coding and ARQ protocol support.
+//!
+//! AFDM (Affine Frequency Division Multiplexing) uses DAFT for superior
+//! performance in doubly-dispersive HF channels.
 
 // Allow dead code for library items that are part of the public API
 // but not currently used internally
@@ -22,7 +25,7 @@ pub use audio::{AudioEngine, RingBuffer as AudioBuffer, PttController};
 pub use dsp::{Fft, Filter, Agc, Afc, ComplexSample};
 pub use fec::{TurboEncoder, TurboDecoder, Interleaver, ConvolutionalEncoder, ViterbiDecoder};
 pub use fec::{K7ConvolutionalEncoder, K7ViterbiDecoder, HuffmanEncoder, HuffmanDecoder};
-pub use modem::{OfdmModulator, OfdmDemodulator, MfskModulator, MfskDemodulator, Preamble, PreambleDetector};
+pub use modem::{AfdmModulator, AfdmDemodulator, MfskModulator, MfskDemodulator, Preamble, PreambleDetector};
 pub use modem::{AckFskModulator, AckFskDemodulator, AckType};
 pub use protocol::{Frame, FrameType, Session, SessionState, ArqController, ArqState, RateAdapter};
 pub use protocol::{Encryptor, EncryptionConfig};
@@ -103,7 +106,7 @@ pub mod prelude {
     pub use crate::audio::AudioEngine;
     pub use crate::dsp::{Fft, Filter, Agc, Afc};
     pub use crate::fec::{TurboEncoder, TurboDecoder};
-    pub use crate::modem::{OfdmModulator, OfdmDemodulator};
+    pub use crate::modem::{AfdmModulator, AfdmDemodulator};
     pub use crate::protocol::{Frame, FrameType, Session, ArqController};
     pub use crate::interface::{TcpServer, Command, Response};
     pub use crate::{Bandwidth, Config, SAMPLE_RATE, CENTER_FREQUENCY};

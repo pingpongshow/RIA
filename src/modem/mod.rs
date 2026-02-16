@@ -1,10 +1,14 @@
 //! Modem module - modulation and demodulation
 //!
-//! Implements OFDM data modulation, MFSK header modulation, and 48-FSK ACK frames
+//! Implements AFDM (Affine Frequency Division Multiplexing) data modulation,
+//! MFSK header modulation, and 48-FSK ACK frames.
+//!
+//! AFDM uses DAFT (Discrete Affine Fourier Transform) instead of FFT for
+//! superior performance in doubly-dispersive channels.
 
 mod preamble;
 mod mfsk;
-mod ofdm;
+mod afdm;
 mod constellation;
 mod sync;
 mod ack_fsk;
@@ -16,7 +20,7 @@ pub use preamble::{Preamble, PreambleDetector, PreambleMode, FastPreambleDetecto
 pub use preamble::{BARKER_5, BARKER_7, BARKER_11, BARKER_13};
 #[allow(unused_imports)]
 pub use mfsk::{MfskModulator, MfskDemodulator};
-pub use ofdm::{OfdmModulator, OfdmDemodulator, OfdmConfig};
+pub use afdm::{AfdmModulator, AfdmDemodulator, AfdmConfig};
 pub use constellation::{Constellation, ConstellationType};
 #[allow(unused_imports)]
 pub use sync::{SymbolSync, TimingRecovery};
@@ -40,7 +44,7 @@ pub enum Bandwidth {
 }
 
 impl Bandwidth {
-    /// Get maximum number of OFDM data carriers for this bandwidth
+    /// Get maximum number of AFDM data carriers for this bandwidth
     pub fn max_carriers(&self) -> usize {
         match self {
             Bandwidth::Narrow => 11,
@@ -62,7 +66,7 @@ impl Bandwidth {
         }
     }
 
-    /// Get maximum number of OFDM data carriers for this bandwidth
+    /// Get maximum number of AFDM data carriers for this bandwidth
     /// Use num_carriers_for_level() to get level-specific carrier counts
     pub fn num_carriers(&self) -> usize {
         self.max_carriers()

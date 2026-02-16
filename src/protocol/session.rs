@@ -5,7 +5,7 @@
 use std::time::{Duration, Instant};
 use super::{Frame, FrameType, ArqController, ArqConfig, ProtocolError, TimerConfig, ConnectionMode};
 use super::{Encryptor, EncryptionConfig};
-use super::rate::{RateNegotiator, NegotiationState, max_mode_for_bandwidth};
+use super::rate::{RateNegotiator, NegotiationState, max_mode_for_bandwidth, FrameSize};
 use crate::fec::crc::{session_seed, generate_random_seed};
 use crate::Bandwidth;
 
@@ -77,6 +77,112 @@ pub enum SessionEvent {
 /// Keepalive interval in seconds (15s for idle frame transmission)
 const KEEPALIVE_INTERVAL_SECS: u64 = 15;
 
+/// Number of consecutive successes required before frame size can grow
+const FRAME_SIZE_GROW_THRESHOLD: usize = 5;
+
+/// SNR thresholds for frame size selection (dB)
+const SHORT_SNR_THRESHOLD: f32 = 6.0;
+const MEDIUM_SNR_THRESHOLD: f32 = 12.0;
+const STANDARD_SNR_THRESHOLD: f32 = 18.0;
+
+/// Frame size negotiator for adaptive frame sizing
+#[derive(Debug, Clone)]
+pub struct FrameSizeNegotiator {
+    current_size: FrameSize,
+    success_count: usize,
+    retransmit_count: usize,
+    last_snr: f32,
+    remote_size: FrameSize,
+}
+
+impl FrameSizeNegotiator {
+    pub fn new() -> Self {
+        Self {
+            current_size: FrameSize::Standard,
+            success_count: 0,
+            retransmit_count: 0,
+            last_snr: 0.0,
+            remote_size: FrameSize::Standard,
+        }
+    }
+
+    /// Called when a frame is successfully acknowledged
+    pub fn on_success(&mut self, snr: f32) -> bool {
+        self.success_count += 1;
+        self.retransmit_count = 0;
+        self.last_snr = snr;
+
+        if self.success_count >= FRAME_SIZE_GROW_THRESHOLD {
+            let snr_supported_size = self.snr_recommended_size(snr);
+            let new_size = self.current_size.larger();
+
+            if new_size != self.current_size && snr_supported_size >= new_size {
+                self.current_size = new_size;
+                self.success_count = 0;
+                log::info!("Frame size increased to {:?} (SNR={:.1}dB)", self.current_size, snr);
+                return true;
+            }
+        }
+        false
+    }
+
+    /// Called when a retransmission is needed
+    pub fn on_retransmit(&mut self) -> bool {
+        self.retransmit_count += 1;
+        self.success_count = 0;
+
+        let new_size = self.current_size.smaller();
+        if new_size != self.current_size {
+            self.current_size = new_size;
+            log::info!("Frame size decreased to {:?} due to retransmit", self.current_size);
+            return true;
+        }
+        false
+    }
+
+    pub fn update_remote_size(&mut self, size: FrameSize) {
+        self.remote_size = size;
+    }
+
+    fn snr_recommended_size(&self, snr: f32) -> FrameSize {
+        if snr < SHORT_SNR_THRESHOLD {
+            FrameSize::Short
+        } else if snr < MEDIUM_SNR_THRESHOLD {
+            FrameSize::Medium
+        } else if snr < STANDARD_SNR_THRESHOLD {
+            FrameSize::Standard
+        } else {
+            FrameSize::Long
+        }
+    }
+
+    pub fn current_size(&self) -> FrameSize {
+        self.current_size
+    }
+
+    pub fn set_size(&mut self, size: FrameSize) {
+        if size != self.current_size {
+            self.current_size = size;
+            self.success_count = 0;
+            self.retransmit_count = 0;
+        }
+    }
+
+    pub fn reset(&mut self) {
+        self.current_size = FrameSize::Standard;
+        self.success_count = 0;
+        self.retransmit_count = 0;
+        self.last_snr = 0.0;
+        self.remote_size = FrameSize::Standard;
+    }
+}
+
+impl Default for FrameSizeNegotiator {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 /// Session manager
 pub struct Session {
     config: SessionConfig,
@@ -109,6 +215,9 @@ pub struct Session {
     // SNR-based rate negotiation
     rate_negotiator: RateNegotiator,
 
+    // Frame size adaptation
+    frame_size_negotiator: FrameSizeNegotiator,
+
     // Event queue
     events: Vec<SessionEvent>,
 
@@ -123,7 +232,7 @@ impl Session {
         let encryptor = Encryptor::new(&config.encryption);
         let max_mode = max_mode_for_bandwidth(config.bandwidth);
         let mut rate_negotiator = RateNegotiator::new(max_mode);
-        // Start at mode 2 for initial connection (most robust OFDM mode)
+        // Start at mode 2 for initial connection (most robust AFDM mode)
         rate_negotiator.agreed_mode = 2;
         Self {
             current_speed: 2, // Start at mode 2 for connection
@@ -143,6 +252,7 @@ impl Session {
             pending_connect: None,
             pending_disconnect_ack: None,
             rate_negotiator,
+            frame_size_negotiator: FrameSizeNegotiator::new(),
             events: Vec::new(),
             bytes_sent: 0,
             bytes_received: 0,
@@ -299,6 +409,7 @@ impl Session {
                         // Add SNR and proposed mode to data frames for rate negotiation
                         frame.header.set_measured_snr(self.rate_negotiator.get_measured_snr_i8());
                         frame.header.set_proposed_mode(self.rate_negotiator.my_proposed_mode);
+                        frame.header.set_frame_size(self.frame_size_negotiator.current_size());
 
                         // Encrypt frame payload if encryption is enabled
                         if self.encryptor.is_enabled() && !frame.payload.is_empty() {
@@ -357,6 +468,9 @@ impl Session {
                     return Ok(()); // Ignore frames from other sessions
                 }
 
+                // Update remote frame size from incoming frame
+                self.frame_size_negotiator.update_remote_size(frame.header.frame_size());
+
                 // Decrypt frame payload before passing to ARQ
                 let mut decrypted_frame = frame;
                 if self.encryptor.is_enabled() && !decrypted_frame.payload.is_empty() {
@@ -386,8 +500,17 @@ impl Session {
             }
             FrameType::DataAck | FrameType::Nack => {
                 if frame.session_id() == self.session_id {
+                    // Update remote frame size from incoming frame
+                    self.frame_size_negotiator.update_remote_size(frame.header.frame_size());
+
                     if let Some(arq) = &mut self.arq {
-                        arq.receive(frame)?;
+                        arq.receive(frame.clone())?;
+                    }
+
+                    // On successful ACK, notify frame size negotiator
+                    if matches!(frame.frame_type(), FrameType::DataAck) {
+                        let snr = frame.header.measured_snr() as f32;
+                        self.frame_size_negotiator.on_success(snr);
                     }
                 }
             }
@@ -498,6 +621,7 @@ impl Session {
                 // Add SNR and proposed mode to ACK frames for rate negotiation
                 frame.header.set_measured_snr(self.rate_negotiator.get_measured_snr_i8());
                 frame.header.set_proposed_mode(self.rate_negotiator.my_proposed_mode);
+                frame.header.set_frame_size(self.frame_size_negotiator.current_size());
                 Some(frame)
             } else {
                 None
@@ -775,6 +899,7 @@ impl Session {
         let mut frame = Frame::idle(self.session_id);
         frame.header.set_measured_snr(self.rate_negotiator.get_measured_snr_i8());
         frame.header.set_proposed_mode(self.rate_negotiator.my_proposed_mode);
+        frame.header.set_frame_size(self.frame_size_negotiator.current_size());
         Some(frame)
     }
 
@@ -813,6 +938,16 @@ impl Session {
     /// Get access to the rate negotiator (for reading state)
     pub fn rate_negotiator(&self) -> &RateNegotiator {
         &self.rate_negotiator
+    }
+
+    /// Get access to the frame size negotiator (for reading state)
+    pub fn frame_size_negotiator(&self) -> &FrameSizeNegotiator {
+        &self.frame_size_negotiator
+    }
+
+    /// Get mutable access to the frame size negotiator
+    pub fn frame_size_negotiator_mut(&mut self) -> &mut FrameSizeNegotiator {
+        &mut self.frame_size_negotiator
     }
 
     /// Check if this station should attempt reconnection after timeout

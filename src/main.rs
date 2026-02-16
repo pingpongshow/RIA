@@ -1,7 +1,10 @@
-//! RIA - High-performance OFDM HF Modem
+//! RIA - High-performance AFDM HF Modem
 //!
 //! A cross-platform amateur radio modem supporting multiple modulation modes,
-//! turbo FEC coding, and ARQ protocol for reliable HF communications.
+//! LDPC FEC coding (IEEE 802.11n QC-LDPC), and ARQ protocol for reliable HF communications.
+//!
+//! Uses AFDM (Affine Frequency Division Multiplexing) with DAFT for superior
+//! performance in doubly-dispersive HF channels.
 
 // Allow dead code for items that are part of the API but not yet fully integrated
 #![allow(dead_code)]
@@ -24,12 +27,12 @@ use protocol::{Session, SessionConfig, SessionState, ConnectionMode, Frame, Sess
 use interface::{TcpServer, TcpConfig, Command, Response};
 use gui::{RiaApp, GuiState, GuiEvent};
 use modem::{
-    OfdmModulator, OfdmDemodulator, OfdmConfig, Bandwidth as ModemBandwidth,
+    AfdmModulator, AfdmDemodulator, AfdmConfig, Bandwidth as ModemBandwidth,
     SpeedLevel, Preamble, PreambleDetector, PreambleMode,
     MfskModulator, MfskDemodulator,
 };
 use dsp::{SignalMetrics, Afc, Fft, real_to_complex, complex_to_real, lin_to_db, wrap_phase_positive};
-use fec::{TurboEncoder, TurboDecoder};
+use fec::{LdpcEncoder, LdpcDecoder};
 
 /// Application configuration
 #[derive(Debug, Clone)]
@@ -200,7 +203,7 @@ fn main() -> Result<()> {
         .format_timestamp_millis()
         .init();
 
-    info!("RIA OFDM HF Modem v{}", env!("CARGO_PKG_VERSION"));
+    info!("RIA AFDM HF Modem v{}", env!("CARGO_PKG_VERSION"));
     info!("Starting up...");
 
     // Load configuration
@@ -403,9 +406,9 @@ fn main() -> Result<()> {
     info!("Starting GUI...");
     let instance_id = std::env::var("RIA_INSTANCE").unwrap_or_else(|_| "0".to_string());
     let window_title = if instance_id == "0" {
-        format!("RIA - OFDM HF Modem [{}]", config.callsign)
+        format!("RIA - AFDM HF Modem [{}]", config.callsign)
     } else {
-        format!("RIA - OFDM HF Modem [{}] (Instance {})", config.callsign, instance_id)
+        format!("RIA - AFDM HF Modem [{}] (Instance {})", config.callsign, instance_id)
     };
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
@@ -416,7 +419,7 @@ fn main() -> Result<()> {
     };
 
     eframe::run_native(
-        "RIA - OFDM HF Modem",
+        "RIA - AFDM HF Modem",
         options,
         Box::new(move |cc| {
             Ok(Box::new(RiaApp::new(cc, gui_state.clone(), gui_events.clone())))
@@ -580,7 +583,7 @@ fn handle_command(cmd: &Command, state: &Arc<Mutex<AppState>>) -> Response {
                 );
                 Response::Custom(format!("CODEC {}", codec_info))
             } else {
-                Response::Custom("CODEC RIA OFDM".to_string())
+                Response::Custom("CODEC RIA AFDM".to_string())
             }
         }
         Command::PttState => {
@@ -966,14 +969,14 @@ fn run_modem_processing(
     // Modes 10-17 require FFT=1024 regardless of bandwidth setting
     let sample_rate = config.sample_rate as f32;
     let modem_bw = to_modem_bandwidth(config.bandwidth);
-    let mut ofdm_config = OfdmConfig::for_speed_level(config.default_speed_level, modem_bw, sample_rate);
+    let mut afdm_config = AfdmConfig::for_speed_level(config.default_speed_level, modem_bw, sample_rate);
 
-    let mut modulator = OfdmModulator::new(
-        OfdmConfig::for_speed_level(config.default_speed_level, modem_bw, sample_rate),
+    let mut modulator = AfdmModulator::new(
+        AfdmConfig::for_speed_level(config.default_speed_level, modem_bw, sample_rate),
         SpeedLevel::new_for_bandwidth(config.default_speed_level, config.bandwidth).constellation_for_bandwidth(config.bandwidth)
     );
-    let mut demodulator = OfdmDemodulator::new(
-        OfdmConfig::for_speed_level(config.default_speed_level, modem_bw, sample_rate),
+    let mut demodulator = AfdmDemodulator::new(
+        AfdmConfig::for_speed_level(config.default_speed_level, modem_bw, sample_rate),
         SpeedLevel::new_for_bandwidth(config.default_speed_level, config.bandwidth).constellation_for_bandwidth(config.bandwidth)
     );
 
@@ -1024,9 +1027,9 @@ fn run_modem_processing(
         current_frame_config.level, current_frame_config.symbols,
         current_frame_config.fec_block_bits, current_frame_config.max_payload_bytes,
         current_code_rate);
-    let mut turbo_encoder = TurboEncoder::new_with_rate(current_frame_config.fec_block_bits, current_code_rate);
-    let mut turbo_decoder = TurboDecoder::new_with_rate(current_frame_config.fec_block_bits, current_code_rate);
-    turbo_decoder.set_iterations(8);
+    let mut ldpc_encoder = LdpcEncoder::new_with_rate(current_frame_config.fec_block_bits, current_code_rate);
+    let mut ldpc_decoder = LdpcDecoder::new_with_rate(current_frame_config.fec_block_bits, current_code_rate);
+    ldpc_decoder.set_iterations(30);
 
     // Signal metrics
     let mut metrics = SignalMetrics::default();
@@ -1038,7 +1041,7 @@ fn run_modem_processing(
     afc.set_max_offset(200.0);        // ±200 Hz max tracking
     afc.set_tracking_bandwidth(100.0); // 100 Hz tracking bandwidth
     afc.set_alpha(0.1);               // Smoothing factor
-    let ofdm_symbol_period = ofdm_config.fft_size; // Symbol period for autocorrelation
+    let afdm_symbol_period = afdm_config.fft_size; // Symbol period for autocorrelation
 
     // FFT for spectrum display (512-point for waterfall)
     let spectrum_fft_size = 512;
@@ -1171,9 +1174,9 @@ fn run_modem_processing(
         if speed_level != current_frame_config.level {
             current_frame_config = get_frame_config(speed_level, config.bandwidth);
             current_code_rate = current_frame_config.code_rate;
-            turbo_encoder = TurboEncoder::new_with_rate(current_frame_config.fec_block_bits, current_code_rate);
-            turbo_decoder = TurboDecoder::new_with_rate(current_frame_config.fec_block_bits, current_code_rate);
-            turbo_decoder.set_iterations(8);
+            ldpc_encoder = LdpcEncoder::new_with_rate(current_frame_config.fec_block_bits, current_code_rate);
+            ldpc_decoder = LdpcDecoder::new_with_rate(current_frame_config.fec_block_bits, current_code_rate);
+            ldpc_decoder.set_iterations(30);
 
             // Update FSK modulator/demodulator if mode changes
             // Use new_for_bandwidth to clamp speed level for 500Hz (max mode 13)
@@ -1192,17 +1195,17 @@ fn run_modem_processing(
             // This ensures correct FFT size and carrier positions for modes 5-9 (FFT=512)
             // vs modes 10-17 (FFT=1024)
             // Use constellation_for_bandwidth to get per-bandwidth modulation
-            ofdm_config = OfdmConfig::for_speed_level(speed_level, modem_bw, sample_rate);
-            modulator = OfdmModulator::new(
-                OfdmConfig::for_speed_level(speed_level, modem_bw, sample_rate),
+            afdm_config = AfdmConfig::for_speed_level(speed_level, modem_bw, sample_rate);
+            modulator = AfdmModulator::new(
+                AfdmConfig::for_speed_level(speed_level, modem_bw, sample_rate),
                 new_speed_level.constellation_for_bandwidth(config.bandwidth)
             );
-            demodulator = OfdmDemodulator::new(
-                OfdmConfig::for_speed_level(speed_level, modem_bw, sample_rate),
+            demodulator = AfdmDemodulator::new(
+                AfdmConfig::for_speed_level(speed_level, modem_bw, sample_rate),
                 new_speed_level.constellation_for_bandwidth(config.bandwidth)
             );
-            info!("Recreated OFDM config/mod/demod for mode {} (FFT={}, carriers={})",
-                speed_level, ofdm_config.fft_size, ofdm_config.num_carriers);
+            info!("Recreated AFDM config/mod/demod for mode {} (FFT={}, carriers={})",
+                speed_level, afdm_config.fft_size, afdm_config.num_carriers);
 
             // Update preamble and detector for new FFT size
             // Different modes use different preamble symbol lengths
@@ -1275,7 +1278,7 @@ fn run_modem_processing(
         }
         prev_listen_enabled = listen_enabled;
 
-        if listen_enabled && !is_transmitting && !in_tx_cooldown && rx_buffer.len() >= ofdm_config.fft_size + ofdm_config.cp_length {
+        if listen_enabled && !is_transmitting && !in_tx_cooldown && rx_buffer.len() >= afdm_config.fft_size + afdm_config.cp_length {
             // Check for preamble timeout
             if let (Some(pending_offset), Some(t)) = (pending_preamble_offset, pending_preamble_time) {
                 if t.elapsed() > pending_preamble_timeout {
@@ -1317,22 +1320,22 @@ fn run_modem_processing(
                 }
 
                 // Demodulate following data
-                // For OFDM: wait for enough symbols per frame config; for FSK: we check inside the FSK block
-                let min_ofdm_samples = (ofdm_config.fft_size + ofdm_config.cp_length) * current_frame_config.symbols;
+                // For AFDM: wait for enough symbols per frame config; for FSK: we check inside the FSK block
+                let min_afdm_samples = (afdm_config.fft_size + afdm_config.cp_length) * current_frame_config.symbols;
                 // For FSK mode, always enter the block and let FSK code check sample count
                 let have_enough = if is_fsk_mode {
                     rx_buffer.len() > offset // Just need some data after preamble for FSK to check
                 } else {
-                    rx_buffer.len() >= offset + min_ofdm_samples
+                    rx_buffer.len() >= offset + min_afdm_samples
                 };
-                debug!("Buffer len={}, offset={}, need={}, is_fsk={}", rx_buffer.len(), offset, offset + min_ofdm_samples, is_fsk_mode);
+                debug!("Buffer len={}, offset={}, need={}, is_fsk={}", rx_buffer.len(), offset, offset + min_afdm_samples, is_fsk_mode);
                 if have_enough {
                     // DEBUG: Record RX buffer AFTER we have enough data for full frame
                     static RX_RECORDED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
                     if !RX_RECORDED.load(std::sync::atomic::Ordering::Relaxed) {
                         RX_RECORDED.store(true, std::sync::atomic::Ordering::Relaxed);
                         eprintln!("[RX-RECORD] Recording {} samples (offset={}, need={}) to rx_buffer.wav",
-                            rx_buffer.len(), offset, offset + min_ofdm_samples);
+                            rx_buffer.len(), offset, offset + min_afdm_samples);
                         if let Ok(file) = std::fs::File::create("test_debug/rx_buffer.wav") {
                             use std::io::Write;
                             let mut writer = std::io::BufWriter::new(file);
@@ -1360,7 +1363,7 @@ fn run_modem_processing(
                         }
                     }
                     let data_samples = &rx_buffer[offset..];
-                    let symbol_len = ofdm_config.fft_size + ofdm_config.cp_length;
+                    let symbol_len = afdm_config.fft_size + afdm_config.cp_length;
                     let num_symbols_raw = data_samples.len() / symbol_len;
                     // CRITICAL: Limit symbols to match per-mode TX frame structure
                     // Processing more symbols would advance pilot phase beyond frame boundary
@@ -1383,8 +1386,8 @@ fn run_modem_processing(
                         if is_fsk_mode {
                             if let Some(ref mut fsk_demod) = fsk_demodulator {
                                 // Calculate samples needed for full FSK frame
-                                let block_size = turbo_decoder.block_size();
-                                let encoded_bits_expected = current_code_rate.output_bits(block_size) + 16;
+                                let block_size = ldpc_decoder.block_size();
+                                let encoded_bits_expected = current_code_rate.ldpc_output_bits(block_size);
                                 let bits_per_symbol = (fsk_demod.num_tones() as f32).log2() as usize;
                                 let fsk_symbols_needed = (encoded_bits_expected + bits_per_symbol - 1) / bits_per_symbol;
                                 let samples_per_fsk_symbol = (sample_rate / fsk_demod.symbol_rate()) as usize;
@@ -1398,14 +1401,14 @@ fn run_modem_processing(
                                     // FSK demodulation - convert hard bits to pseudo-soft bits
                                     let hard_bits = fsk_demod.demodulate_bits(data_samples);
 
-                                    // Convert hard bits to soft bits for turbo decoder
-                                    // Use +1.0 for bit 0, -1.0 for bit 1 (turbo decoder convention)
+                                    // Convert hard bits to soft bits for LDPC decoder
+                                    // Use +1.0 for bit 0, -1.0 for bit 1 (decoder convention)
                                     let all_soft_bits: Vec<f32> = hard_bits.iter()
                                         .map(|&b| if b == 0 { 1.0 } else { -1.0 })
                                         .collect();
 
                                     if all_soft_bits.len() >= encoded_bits_expected {
-                                        let decoded_bits = turbo_decoder.decode(&all_soft_bits[..encoded_bits_expected]);
+                                        let decoded_bits = ldpc_decoder.decode(&all_soft_bits[..encoded_bits_expected]);
 
                                         let decoded_bytes: Vec<u8> = decoded_bits.chunks(8)
                                             .map(|chunk| {
@@ -1449,11 +1452,11 @@ fn run_modem_processing(
                                 }
                             }
                         } else {
-                        // OFDM mode: Apply AFC and demodulate
+                        // AFDM mode: Apply AFC and demodulate
                         let mut complex_samples = real_to_complex(data_samples);
 
                         // Estimate frequency offset using autocorrelation at symbol period
-                        let freq_error = afc.estimate_offset(&complex_samples, ofdm_symbol_period);
+                        let freq_error = afc.estimate_offset(&complex_samples, afdm_symbol_period);
                         afc.update(freq_error);
 
                         // Apply frequency correction to all samples
@@ -1465,8 +1468,8 @@ fn run_modem_processing(
                         // Find optimal timing offset using cyclic prefix correlation
                         // CP is first cp_len samples, which are a copy of the last cp_len of the body
                         // Symbol structure: [CP (128)] [Body (1024)] where CP = Body[896..1024]
-                        let cp_len = ofdm_config.cp_length;
-                        let fft_size = ofdm_config.fft_size;
+                        let cp_len = afdm_config.cp_length;
+                        let fft_size = afdm_config.fft_size;
                         let search_range = symbol_len.min(corrected_samples.len().saturating_sub(symbol_len));
                         let mut best_offset = 0;
                         let mut best_corr = 0.0f32;
@@ -1505,7 +1508,7 @@ fn run_modem_processing(
                             pending_preamble_time = None;
                         } else {
 
-                        // Demodulate ALL OFDM symbols (not just one) starting from best offset
+                        // Demodulate ALL AFDM symbols (not just one) starting from best offset
                         let mut all_soft_bits = Vec::new();
                         for sym_idx in 0..num_symbols {
                             let sym_start = best_offset + sym_idx * symbol_len;
@@ -1529,7 +1532,7 @@ fn run_modem_processing(
                         }
 
                         // Decode with FEC if we have enough bits for a block
-                        let block_size = turbo_decoder.block_size();
+                        let block_size = ldpc_decoder.block_size();
 
                         // Debug: check soft bit statistics
                         if !all_soft_bits.is_empty() {
@@ -1540,13 +1543,13 @@ fn run_modem_processing(
                                    all_soft_bits.len(), avg, min, max);
                         }
 
-                        // Calculate expected encoded bits based on code rate (plus 16 tail bits)
-                        let encoded_bits_expected = current_code_rate.output_bits(block_size) + 16;
-                        debug!("Demodulated {} soft bits from {} symbols, need {} for turbo decode (rate {:?})",
+                        // Calculate expected encoded bits based on LDPC block size (no tail bits)
+                        let encoded_bits_expected = current_code_rate.ldpc_output_bits(block_size);
+                        debug!("Demodulated {} soft bits from {} symbols, need {} for LDPC decode (rate {:?})",
                                all_soft_bits.len(), num_symbols, encoded_bits_expected, current_code_rate);
                         if all_soft_bits.len() >= encoded_bits_expected {
-                            // Decode turbo code (pass all received bits to decoder which will demux based on rate)
-                            let decoded_bits = turbo_decoder.decode(&all_soft_bits[..encoded_bits_expected]);
+                            // Decode LDPC code
+                            let decoded_bits = ldpc_decoder.decode(&all_soft_bits[..encoded_bits_expected]);
 
                             let decoded_bytes: Vec<u8> = decoded_bits.chunks(8)
                                 .map(|chunk| {
@@ -1556,7 +1559,7 @@ fn run_modem_processing(
                                 })
                                 .collect();
 
-                            debug!("Turbo decoded {} bytes: {:02x?}", decoded_bytes.len(), &decoded_bytes);
+                            debug!("LDPC decoded {} bytes: {:02x?}", decoded_bytes.len(), &decoded_bytes);
 
                             // Parse as frame
                             match Frame::decode(&decoded_bytes) {
@@ -1593,20 +1596,20 @@ fn run_modem_processing(
                                     // to prevent re-detecting the same false preamble
                                     pending_preamble_offset = None;
                                     pending_preamble_time = None;
-                                    // Drain full estimated frame size (preamble + 48 OFDM symbols) to skip corrupted frame
+                                    // Drain full estimated frame size (preamble + 48 AFDM symbols) to skip corrupted frame
                                     let preamble_len = preamble.samples().len();
-                                    let ofdm_frame_len = 48 * (ofdm_config.fft_size + ofdm_config.cp_length); // 48 OFDM symbols
-                                    let full_frame_len = preamble_len + ofdm_frame_len;
+                                    let afdm_frame_len = 48 * (afdm_config.fft_size + afdm_config.cp_length); // 48 AFDM symbols
+                                    let full_frame_len = preamble_len + afdm_frame_len;
                                     let drain_len = full_frame_len.min(rx_buffer.len());
                                     rx_buffer.drain(0..drain_len);
-                                    debug!("Drained {} samples after failed decode (preamble {} + OFDM {})", drain_len, preamble_len, ofdm_frame_len);
+                                    debug!("Drained {} samples after failed decode (preamble {} + AFDM {})", drain_len, preamble_len, afdm_frame_len);
                                     preamble_detector.reset();
                                 }
                             }
                         }
                     } // end if best_corr >= 0.5
                     }
-                } // end else (OFDM mode)
+                } // end else (AFDM mode)
                 }
 
                 // Note: Buffer draining is now handled inside the successful decode path
@@ -1674,10 +1677,10 @@ fn run_modem_processing(
                             let bits: Vec<u8> = frame_bytes.iter()
                                 .flat_map(|&b| (0..8).rev().map(move |i| (b >> i) & 1))
                                 .collect();
-                            let block_size = turbo_encoder.block_size();
+                            let block_size = ldpc_encoder.block_size();
                             let mut padded_bits = bits.clone();
                             padded_bits.resize(block_size, 0);
-                            let encoded = turbo_encoder.encode(&padded_bits);
+                            let encoded = ldpc_encoder.encode(&padded_bits);
                             let modulated = if is_fsk_mode {
                                 if let Some(ref mut fsk_mod) = fsk_modulator {
                                     fsk_mod.reset();
@@ -1808,16 +1811,16 @@ fn run_modem_processing(
 
                             let frame_bytes = frame.encode();
                             debug!("TX Frame: {} bytes", frame_bytes.len());
-                            // Convert bytes to bits for turbo encoding
+                            // Convert bytes to bits for LDPC encoding
                             let bits: Vec<u8> = frame_bytes.iter()
                                 .flat_map(|&b| (0..8).rev().map(move |i| (b >> i) & 1))
                                 .collect();
                             // Pad to block size
-                            let block_size = turbo_encoder.block_size();
+                            let block_size = ldpc_encoder.block_size();
                             let mut padded_bits = bits.clone();
                             padded_bits.resize(block_size, 0);
-                            let encoded = turbo_encoder.encode(&padded_bits);
-                            debug!("Turbo encoded: {} bits -> {} bits", block_size, encoded.len());
+                            let encoded = ldpc_encoder.encode(&padded_bits);
+                            debug!("LDPC encoded: {} bits -> {} bits", block_size, encoded.len());
                             let modulated = if is_fsk_mode {
                                 if let Some(ref mut fsk_mod) = fsk_modulator {
                                     fsk_mod.reset();
@@ -1933,10 +1936,10 @@ fn run_modem_processing(
                         let bits: Vec<u8> = frame_bytes.iter()
                             .flat_map(|&b| (0..8).rev().map(move |i| (b >> i) & 1))
                             .collect();
-                        let block_size = turbo_encoder.block_size();
+                        let block_size = ldpc_encoder.block_size();
                         let mut padded_bits = bits.clone();
                         padded_bits.resize(block_size, 0);
-                        let encoded = turbo_encoder.encode(&padded_bits);
+                        let encoded = ldpc_encoder.encode(&padded_bits);
                         let modulated = if is_fsk_mode {
                             if let Some(ref mut fsk_mod) = fsk_modulator {
                                 fsk_mod.reset();
@@ -1974,10 +1977,10 @@ fn run_modem_processing(
                         let bits: Vec<u8> = frame_bytes.iter()
                             .flat_map(|&b| (0..8).rev().map(move |i| (b >> i) & 1))
                             .collect();
-                        let block_size = turbo_encoder.block_size();
+                        let block_size = ldpc_encoder.block_size();
                         let mut padded_bits = bits.clone();
                         padded_bits.resize(block_size, 0);
-                        let encoded = turbo_encoder.encode(&padded_bits);
+                        let encoded = ldpc_encoder.encode(&padded_bits);
                         let modulated = if is_fsk_mode {
                             if let Some(ref mut fsk_mod) = fsk_modulator {
                                 fsk_mod.reset();
@@ -2002,10 +2005,10 @@ fn run_modem_processing(
                         let bits: Vec<u8> = frame_bytes.iter()
                             .flat_map(|&b| (0..8).rev().map(move |i| (b >> i) & 1))
                             .collect();
-                        let block_size = turbo_encoder.block_size();
+                        let block_size = ldpc_encoder.block_size();
                         let mut padded_bits = bits.clone();
                         padded_bits.resize(block_size, 0);
-                        let encoded = turbo_encoder.encode(&padded_bits);
+                        let encoded = ldpc_encoder.encode(&padded_bits);
                         let modulated = if is_fsk_mode {
                             if let Some(ref mut fsk_mod) = fsk_modulator {
                                 fsk_mod.reset();
@@ -2030,10 +2033,10 @@ fn run_modem_processing(
                         let bits: Vec<u8> = frame_bytes.iter()
                             .flat_map(|&b| (0..8).rev().map(move |i| (b >> i) & 1))
                             .collect();
-                        let block_size = turbo_encoder.block_size();
+                        let block_size = ldpc_encoder.block_size();
                         let mut padded_bits = bits.clone();
                         padded_bits.resize(block_size, 0);
-                        let encoded = turbo_encoder.encode(&padded_bits);
+                        let encoded = ldpc_encoder.encode(&padded_bits);
                         let modulated = if is_fsk_mode {
                             if let Some(ref mut fsk_mod) = fsk_modulator {
                                 fsk_mod.reset();
@@ -2060,10 +2063,10 @@ fn run_modem_processing(
                     let bits: Vec<u8> = frame_bytes.iter()
                         .flat_map(|&b| (0..8).rev().map(move |i| (b >> i) & 1))
                         .collect();
-                    let block_size = turbo_encoder.block_size();
+                    let block_size = ldpc_encoder.block_size();
                     let mut padded_bits = bits.clone();
                     padded_bits.resize(block_size, 0);
-                    let encoded = turbo_encoder.encode(&padded_bits);
+                    let encoded = ldpc_encoder.encode(&padded_bits);
                     let modulated = if is_fsk_mode {
                         if let Some(ref mut fsk_mod) = fsk_modulator {
                             fsk_mod.reset();

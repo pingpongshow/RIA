@@ -1,7 +1,9 @@
 //! Digital Signal Processing module
 //!
-//! Provides FFT, filtering, AGC, AFC, and signal analysis functions.
+//! Provides DAFT (Discrete Affine Fourier Transform), FFT, filtering, AGC, AFC,
+//! and signal analysis functions.
 
+mod daft;
 mod fft;
 mod filter;
 mod agc;
@@ -9,6 +11,7 @@ mod afc;
 mod metrics;
 mod window;
 
+pub use daft::{Daft, ChirpParams};
 #[allow(unused_imports)]
 pub use fft::{Fft, FftDirection};
 #[allow(unused_imports)]
