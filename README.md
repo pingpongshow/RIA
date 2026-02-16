@@ -35,7 +35,6 @@ RIA supports 17 speed levels with automatic rate negotiation:
 | 14   | 8-PSK      | 3/4       | ~4200 bps         | 27 dB   |
 | 15   | 16-QAM     | 3/4       | ~5600 bps         | 29 dB   |
 | 16   | 32-QAM     | 5/6       | ~7050 bps         | 31 dB   |
-| 17   | 32-QAM     | 5/6       | ~8489 bps         | 33 dB   |
 
 *Mode 1 (FSK) is disabled pending soft-decision decoder implementation.*
 
@@ -307,3 +306,4 @@ cargo test --release
   - 500 Hz: modes 2-13
   - 2300 Hz: modes 2-16
   - 2750 Hz: modes 2-17
+
