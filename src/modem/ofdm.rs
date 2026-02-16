@@ -4,6 +4,8 @@
 
 use std::f32::consts::PI;
 use crate::dsp::{ComplexSample, Fft, wrap_phase};
+use crate::protocol::clamp_mode_for_bandwidth;
+use crate::Bandwidth as ConfigBandwidth;
 use super::{Symbol, Constellation, ConstellationType, Bandwidth};
 
 /// OFDM configuration
@@ -41,10 +43,13 @@ impl OfdmConfig {
 
     /// Create configuration for given speed level
     /// Uses per-bandwidth frame config for FFT size (500Hz modes 4-6 need FFT=1024)
+    /// Speed level is automatically clamped to valid range for the bandwidth:
+    /// - 500 Hz: modes 2-13
+    /// - 2300 Hz: modes 2-16
+    /// - 2750 Hz: modes 2-17
     pub fn for_speed_level(speed_level: u8, bandwidth: Bandwidth, sample_rate: f32) -> Self {
         use crate::modem::SpeedLevel;
         use crate::protocol::get_frame_config;
-        use crate::Bandwidth as ConfigBandwidth;
 
         // Convert modem Bandwidth to config Bandwidth
         let config_bw = match bandwidth {
@@ -53,8 +58,12 @@ impl OfdmConfig {
             Bandwidth::Ultra => ConfigBandwidth::Hz2750,
         };
 
+        // Clamp speed level to valid range for this bandwidth
+        // This prevents mode 17 being used with 2300Hz (max 16) or 500Hz (max 13)
+        let clamped_level = clamp_mode_for_bandwidth(speed_level, config_bw);
+
         // Get FFT size from per-bandwidth frame config
-        let frame_config = get_frame_config(speed_level, config_bw);
+        let frame_config = get_frame_config(clamped_level, config_bw);
         let fft_size = frame_config.fft_size;
 
         let cp_length = match fft_size {
@@ -65,7 +74,7 @@ impl OfdmConfig {
         };
 
         // Use carrier count from rate table for this level and bandwidth
-        let level = SpeedLevel::new(speed_level);
+        let level = SpeedLevel::new(clamped_level);
         let num_carriers = level.num_carriers(bandwidth);
 
         Self::build(fft_size, cp_length, num_carriers, sample_rate)

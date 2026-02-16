@@ -291,6 +291,10 @@ pub enum NegotiationState {
 /// Timeout for AwaitingAck state in seconds (rollback if no ACK received)
 const SPEED_CHANGE_ACK_TIMEOUT_SECS: u64 = 10;
 
+/// Minimum time between mode changes in milliseconds (debounce to prevent oscillation)
+/// This prevents rapid upshift->downshift->upshift cycles when SNR fluctuates near threshold
+const MODE_CHANGE_DEBOUNCE_MS: u64 = 500;
+
 /// SNR-based rate negotiation state
 #[derive(Debug, Clone)]
 pub struct RateNegotiator {
@@ -330,6 +334,8 @@ pub struct RateNegotiator {
     pub frames_since_connect: u8,
     /// Time when we entered AwaitingAck state (for timeout detection)
     awaiting_ack_since: Option<Instant>,
+    /// Time of last mode change (for debounce)
+    last_mode_change: Instant,
 }
 
 impl RateNegotiator {
@@ -354,6 +360,7 @@ impl RateNegotiator {
             is_initiator: false,
             frames_since_connect: 0,
             awaiting_ack_since: None,
+            last_mode_change: Instant::now(),
         }
     }
 
@@ -389,19 +396,26 @@ impl RateNegotiator {
         // Calculate my proposed mode based on smoothed SNR
         let new_proposed = calculate_proposed_mode(self.snr_ewma, self.agreed_mode, self.max_mode);
 
-        // Fast down: immediate if SNR below stay threshold
+        // Debounce: prevent mode changes too quickly to avoid oscillation
+        let debounce_elapsed = self.last_mode_change.elapsed().as_millis() as u64;
+        let debounce_ok = debounce_elapsed >= MODE_CHANGE_DEBOUNCE_MS;
+
+        // Fast down: immediate if SNR below stay threshold (but respect debounce)
         if new_proposed < self.agreed_mode {
             self.my_proposed_mode = new_proposed;
             self.upshift_counter = 0;
-            // Reset initial upshift flag on downshift so we can rapid upshift again
-            self.initial_upshift_done = false;
-            return self.check_mode_agreement();
+            // NOTE: Do NOT reset initial_upshift_done on downshift
+            // This prevents oscillation where we rapidly upshift after every downshift
+            if debounce_ok {
+                return self.check_mode_agreement();
+            }
+            return false;
         }
 
         // Rapid initial upshift: after first few frames at mode 2, jump directly to SNR-supported mode
         // This allows fast channel acquisition while still being conservative on subsequent changes
         if !self.initial_upshift_done && self.agreed_mode == 2 && self.frames_since_connect >= 2 {
-            if new_proposed > self.agreed_mode {
+            if new_proposed > self.agreed_mode && debounce_ok {
                 log::info!("Rapid initial upshift from mode 2 to mode {}", new_proposed);
                 self.my_proposed_mode = new_proposed;
                 self.initial_upshift_done = true;
@@ -413,7 +427,7 @@ impl RateNegotiator {
         // Slow up: require consecutive good readings (after initial upshift)
         if new_proposed > self.agreed_mode {
             self.upshift_counter += 1;
-            if self.upshift_counter >= self.upshift_threshold {
+            if self.upshift_counter >= self.upshift_threshold && debounce_ok {
                 self.my_proposed_mode = new_proposed;
                 self.upshift_counter = 0;
                 return self.check_mode_agreement();
@@ -500,6 +514,7 @@ impl RateNegotiator {
                 self.agreed_mode = confirmed_mode;
                 self.pending_mode = None;
                 self.negotiation_state = NegotiationState::Idle;
+                self.last_mode_change = Instant::now();
                 log::info!("Mode change confirmed: now at mode {}", self.agreed_mode);
             }
         }
@@ -510,6 +525,7 @@ impl RateNegotiator {
         if let Some(pending) = self.pending_mode.take() {
             self.agreed_mode = pending;
             self.negotiation_state = NegotiationState::Idle;
+            self.last_mode_change = Instant::now();
             log::info!("Mode switch complete: now at mode {}", self.agreed_mode);
         }
     }
@@ -528,6 +544,7 @@ impl RateNegotiator {
                 self.upshift_counter = 0;
                 self.negotiation_state = NegotiationState::Idle;
                 self.pending_mode = None;
+                self.last_mode_change = Instant::now();
                 return true;
             }
         }
@@ -549,6 +566,7 @@ impl RateNegotiator {
         self.initial_upshift_done = false;
         self.frames_since_connect = 0;
         self.awaiting_ack_since = None;
+        self.last_mode_change = Instant::now();
         // Note: is_initiator is NOT reset here - it persists for reconnection logic
     }
 
@@ -1042,21 +1060,28 @@ pub const FRAME_CONFIG_2300: [FrameConfig; 17] = [
     FrameConfig { level: 7, fft_size: 512, symbols: 96, fec_block_bits: 472, max_payload_bytes: 43, frame_duration_ms: 1490, modulation: ModulationType::Qpsk, code_rate: CodeRate::Rate1_2 },
     FrameConfig { level: 8, fft_size: 512, symbols: 96, fec_block_bits: 664, max_payload_bytes: 67, frame_duration_ms: 1490, modulation: ModulationType::Qpsk, code_rate: CodeRate::Rate1_2 },
     FrameConfig { level: 9, fft_size: 512, symbols: 96, fec_block_bits: 760, max_payload_bytes: 79, frame_duration_ms: 1490, modulation: ModulationType::Qpsk, code_rate: CodeRate::Rate1_2 },
-    FrameConfig { level: 10, fft_size: 1024, symbols: 49, fec_block_bits: 2016, max_payload_bytes: 236, frame_duration_ms: 1490, modulation: ModulationType::Qpsk, code_rate: CodeRate::Rate1_2 },
-    // Mode 11: QPSK rate 2/3
-    FrameConfig { level: 11, fft_size: 1024, symbols: 49, fec_block_bits: 2688, max_payload_bytes: 320, frame_duration_ms: 1490, modulation: ModulationType::Qpsk, code_rate: CodeRate::Rate2_3 },
-    // Mode 12: QPSK rate 3/4
-    FrameConfig { level: 12, fft_size: 1024, symbols: 49, fec_block_bits: 3024, max_payload_bytes: 362, frame_duration_ms: 1490, modulation: ModulationType::Qpsk, code_rate: CodeRate::Rate3_4 },
-    // Mode 13: 8PSK rate 2/3
-    FrameConfig { level: 13, fft_size: 1024, symbols: 49, fec_block_bits: 4032, max_payload_bytes: 488, frame_duration_ms: 1490, modulation: ModulationType::Psk8, code_rate: CodeRate::Rate2_3 },
-    // Mode 14: 8PSK rate 3/4
-    FrameConfig { level: 14, fft_size: 1024, symbols: 49, fec_block_bits: 4536, max_payload_bytes: 551, frame_duration_ms: 1490, modulation: ModulationType::Psk8, code_rate: CodeRate::Rate3_4 },
-    // Mode 15: 16QAM rate 3/4
-    FrameConfig { level: 15, fft_size: 1024, symbols: 49, fec_block_bits: 6048, max_payload_bytes: 740, frame_duration_ms: 1490, modulation: ModulationType::Qam16, code_rate: CodeRate::Rate3_4 },
-    // Mode 16: 32QAM rate 5/6 - 2300Hz MAX MODE
-    FrameConfig { level: 16, fft_size: 1024, symbols: 49, fec_block_bits: 7560, max_payload_bytes: 929, frame_duration_ms: 1490, modulation: ModulationType::Qam32, code_rate: CodeRate::Rate5_6 },
+    // LDPC modes: fec_block_bits = num_codewords × k, where k = info_bits(1944, rate)
+    // OFDM: 49 carriers, ~6 pilots = 43 data carriers
+    // Rate 1/2: k=972, encoded=1944 per codeword
+    // Rate 2/3: k=1296, encoded=1944 per codeword
+    // Rate 3/4: k=1458, encoded=1944 per codeword
+    // Rate 5/6: k=1620, encoded=1944 per codeword
+    // Mode 10: QPSK (86 bits/sym), 49 sym → 4214 bits, 2 codewords (3888), k_total=1944
+    FrameConfig { level: 10, fft_size: 1024, symbols: 49, fec_block_bits: 1944, max_payload_bytes: 227, frame_duration_ms: 1490, modulation: ModulationType::Qpsk, code_rate: CodeRate::Rate1_2 },
+    // Mode 11: QPSK rate 2/3, 2 codewords (3888), k_total=2592
+    FrameConfig { level: 11, fft_size: 1024, symbols: 49, fec_block_bits: 2592, max_payload_bytes: 308, frame_duration_ms: 1490, modulation: ModulationType::Qpsk, code_rate: CodeRate::Rate2_3 },
+    // Mode 12: QPSK rate 3/4, 2 codewords (3888), k_total=2916
+    FrameConfig { level: 12, fft_size: 1024, symbols: 49, fec_block_bits: 2916, max_payload_bytes: 348, frame_duration_ms: 1490, modulation: ModulationType::Qpsk, code_rate: CodeRate::Rate3_4 },
+    // Mode 13: 8PSK (129 bits/sym), 49 sym → 6321 bits, 3 codewords (5832), k_total=3888
+    FrameConfig { level: 13, fft_size: 1024, symbols: 49, fec_block_bits: 3888, max_payload_bytes: 470, frame_duration_ms: 1490, modulation: ModulationType::Psk8, code_rate: CodeRate::Rate2_3 },
+    // Mode 14: 8PSK rate 3/4, 3 codewords (5832), k_total=4374
+    FrameConfig { level: 14, fft_size: 1024, symbols: 49, fec_block_bits: 4374, max_payload_bytes: 530, frame_duration_ms: 1490, modulation: ModulationType::Psk8, code_rate: CodeRate::Rate3_4 },
+    // Mode 15: 16QAM (172 bits/sym), 49 sym → 8428 bits, 4 codewords (7776), k_total=5832
+    FrameConfig { level: 15, fft_size: 1024, symbols: 49, fec_block_bits: 5832, max_payload_bytes: 712, frame_duration_ms: 1490, modulation: ModulationType::Qam16, code_rate: CodeRate::Rate3_4 },
+    // Mode 16: 32QAM (215 bits/sym), 49 sym → 10535 bits, 5 codewords (9720), k_total=8100
+    FrameConfig { level: 16, fft_size: 1024, symbols: 49, fec_block_bits: 8100, max_payload_bytes: 996, frame_duration_ms: 1490, modulation: ModulationType::Qam32, code_rate: CodeRate::Rate5_6 },
     // Mode 17: NOT for 2300Hz - fallback entry only (uses same as mode 16)
-    FrameConfig { level: 17, fft_size: 1024, symbols: 49, fec_block_bits: 7560, max_payload_bytes: 929, frame_duration_ms: 1490, modulation: ModulationType::Qam32, code_rate: CodeRate::Rate5_6 },
+    FrameConfig { level: 17, fft_size: 1024, symbols: 49, fec_block_bits: 8100, max_payload_bytes: 996, frame_duration_ms: 1490, modulation: ModulationType::Qam32, code_rate: CodeRate::Rate5_6 },
 ];
 
 /// Frame configurations for 500 Hz bandwidth
@@ -1125,20 +1150,21 @@ pub const FRAME_CONFIG_2750: [FrameConfig; 17] = [
     FrameConfig { level: 10, fft_size: 512, symbols: 100, fec_block_bits: 1088, max_payload_bytes: 120, frame_duration_ms: 1070, modulation: ModulationType::Qpsk, code_rate: CodeRate::Rate1_2 },
     // Mode 11-17: 59 carriers (51 data + 8 pilots), FFT=1024
     // QPSK: 51*2=102 bits/sym, 8PSK: 51*3=153 bits/sym, 16QAM: 51*4=204 bits/sym, 32QAM: 51*5=255 bits/sym
-    // Mode 11: QPSK rate 1/2, 102 bits/sym, 50 sym → 5100 raw >= 2536*2+16=5088
-    FrameConfig { level: 11, fft_size: 1024, symbols: 50, fec_block_bits: 2536, max_payload_bytes: 301, frame_duration_ms: 1200, modulation: ModulationType::Qpsk, code_rate: CodeRate::Rate1_2 },
-    // Mode 12: QPSK rate 2/3, 102 bits/sym, 50 sym → 5100 raw >= 3384*1.5+16=5092
-    FrameConfig { level: 12, fft_size: 1024, symbols: 50, fec_block_bits: 3384, max_payload_bytes: 407, frame_duration_ms: 1200, modulation: ModulationType::Qpsk, code_rate: CodeRate::Rate2_3 },
-    // Mode 13: QPSK rate 3/4, 102 bits/sym, 50 sym → 5100 raw >= 3808*1.33+16=5080
-    FrameConfig { level: 13, fft_size: 1024, symbols: 50, fec_block_bits: 3808, max_payload_bytes: 460, frame_duration_ms: 1200, modulation: ModulationType::Qpsk, code_rate: CodeRate::Rate3_4 },
-    // Mode 14: 8PSK rate 2/3, 153 bits/sym, 50 sym → 7650 raw >= 5080*1.5+16=7636
-    FrameConfig { level: 14, fft_size: 1024, symbols: 50, fec_block_bits: 5080, max_payload_bytes: 619, frame_duration_ms: 1200, modulation: ModulationType::Psk8, code_rate: CodeRate::Rate2_3 },
-    // Mode 15: 8PSK rate 3/4, 153 bits/sym, 50 sym → 7650 raw >= 5720*1.33+16=7623
-    FrameConfig { level: 15, fft_size: 1024, symbols: 50, fec_block_bits: 5720, max_payload_bytes: 699, frame_duration_ms: 1200, modulation: ModulationType::Psk8, code_rate: CodeRate::Rate3_4 },
-    // Mode 16: 16QAM rate 3/4, 204 bits/sym, 50 sym → 10200 raw >= 7632*1.33+16=10166
-    FrameConfig { level: 16, fft_size: 1024, symbols: 50, fec_block_bits: 7632, max_payload_bytes: 938, frame_duration_ms: 1200, modulation: ModulationType::Qam16, code_rate: CodeRate::Rate3_4 },
-    // Mode 17: 32QAM rate 5/6, 255 bits/sym, 50 sym → 12750 raw >= 9536*1.2+16=11459
-    FrameConfig { level: 17, fft_size: 1024, symbols: 50, fec_block_bits: 9536, max_payload_bytes: 1176, frame_duration_ms: 1200, modulation: ModulationType::Qam32, code_rate: CodeRate::Rate5_6 },
+    // LDPC: Rate 1/2 k=972, Rate 2/3 k=1296, Rate 3/4 k=1458, Rate 5/6 k=1620
+    // Mode 11: QPSK rate 1/2, 50 sym × 102 = 5100 bits, 2 codewords (3888), k_total=1944
+    FrameConfig { level: 11, fft_size: 1024, symbols: 50, fec_block_bits: 1944, max_payload_bytes: 227, frame_duration_ms: 1200, modulation: ModulationType::Qpsk, code_rate: CodeRate::Rate1_2 },
+    // Mode 12: QPSK rate 2/3, 2 codewords (3888), k_total=2592
+    FrameConfig { level: 12, fft_size: 1024, symbols: 50, fec_block_bits: 2592, max_payload_bytes: 308, frame_duration_ms: 1200, modulation: ModulationType::Qpsk, code_rate: CodeRate::Rate2_3 },
+    // Mode 13: QPSK rate 3/4, 2 codewords (3888), k_total=2916
+    FrameConfig { level: 13, fft_size: 1024, symbols: 50, fec_block_bits: 2916, max_payload_bytes: 348, frame_duration_ms: 1200, modulation: ModulationType::Qpsk, code_rate: CodeRate::Rate3_4 },
+    // Mode 14: 8PSK rate 2/3, 50 sym × 153 = 7650 bits, 3 codewords (5832), k_total=3888
+    FrameConfig { level: 14, fft_size: 1024, symbols: 50, fec_block_bits: 3888, max_payload_bytes: 470, frame_duration_ms: 1200, modulation: ModulationType::Psk8, code_rate: CodeRate::Rate2_3 },
+    // Mode 15: 8PSK rate 3/4, 3 codewords (5832), k_total=4374
+    FrameConfig { level: 15, fft_size: 1024, symbols: 50, fec_block_bits: 4374, max_payload_bytes: 530, frame_duration_ms: 1200, modulation: ModulationType::Psk8, code_rate: CodeRate::Rate3_4 },
+    // Mode 16: 16QAM rate 3/4, 50 sym × 204 = 10200 bits, 5 codewords (9720), k_total=7290
+    FrameConfig { level: 16, fft_size: 1024, symbols: 50, fec_block_bits: 7290, max_payload_bytes: 895, frame_duration_ms: 1200, modulation: ModulationType::Qam16, code_rate: CodeRate::Rate3_4 },
+    // Mode 17: 32QAM rate 5/6, 50 sym × 255 = 12750 bits, 6 codewords (11664), k_total=9720
+    FrameConfig { level: 17, fft_size: 1024, symbols: 50, fec_block_bits: 9720, max_payload_bytes: 1199, frame_duration_ms: 1200, modulation: ModulationType::Qam32, code_rate: CodeRate::Rate5_6 },
 ];
 
 /// Get frame configuration for a speed level and bandwidth
