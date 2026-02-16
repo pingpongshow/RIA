@@ -1,0 +1,81 @@
+[package]
+name = "ria"
+version = "0.1.0"
+edition = "2021"
+authors = ["RIA Development Team"]
+description = "RIA - High-performance OFDM HF Modem"
+license = "MIT"
+readme = "README.md"
+repository = "https://github.com/yourusername/ria"
+keywords = ["ham-radio", "hf", "modem", "ofdm", "arq"]
+categories = ["multimedia::audio", "network-programming"]
+
+[features]
+default = ["gui"]
+gui = ["eframe", "egui", "egui_extras"]
+headless = []
+serde = []
+serial = []
+
+[dependencies]
+# Audio I/O
+cpal = "0.15"
+rodio = "0.18"
+
+# DSP
+rustfft = "6.2"
+realfft = "3.3"
+num-complex = "0.4"
+num-traits = "0.2"
+
+# Networking
+tokio = { version = "1", features = ["full"] }
+tokio-util = { version = "0.7", features = ["codec"] }
+bytes = "1"
+
+# GUI (optional)
+eframe = { version = "0.29", optional = true }
+egui = { version = "0.29", optional = true }
+egui_extras = { version = "0.29", optional = true, features = ["image"] }
+
+# Serialization
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+toml = "0.8"
+
+# Utilities
+crossbeam-channel = "0.5"
+parking_lot = "0.12"
+log = "0.4"
+env_logger = "0.11"
+anyhow = "1"
+thiserror = "1"
+bitflags = "2"
+crc = "3"
+rand = "0.8"
+sha2 = "0.10"
+
+# Encryption (optional AES-256-GCM)
+aes-gcm = "0.10"
+pbkdf2 = { version = "0.12", features = ["sha2"] }
+hmac = "0.12"
+
+# Time
+chrono = "0.4"
+
+# Platform utilities
+dirs = "5"
+
+[dev-dependencies]
+criterion = "0.5"
+proptest = "1"
+
+[profile.release]
+lto = true
+codegen-units = 1
+panic = "abort"
+strip = true
+
+[profile.bench]
+lto = true
+codegen-units = 1
