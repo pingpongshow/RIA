@@ -1,7 +1,7 @@
 //! RIA - High-performance OFDM HF Modem
 //!
 //! A cross-platform amateur radio modem supporting multiple modulation modes,
-//! turbo FEC coding, and ARQ protocol for reliable HF communications.
+//! LDPC FEC coding (IEEE 802.11n QC-LDPC), and ARQ protocol for reliable HF communications.
 
 // Allow dead code for items that are part of the API but not yet fully integrated
 #![allow(dead_code)]
@@ -29,7 +29,7 @@ use modem::{
     MfskModulator, MfskDemodulator,
 };
 use dsp::{SignalMetrics, Afc, Fft, real_to_complex, complex_to_real, lin_to_db, wrap_phase_positive};
-use fec::{TurboEncoder, TurboDecoder};
+use fec::{LdpcEncoder, LdpcDecoder};
 
 /// Application configuration
 #[derive(Debug, Clone)]
@@ -1024,9 +1024,9 @@ fn run_modem_processing(
         current_frame_config.level, current_frame_config.symbols,
         current_frame_config.fec_block_bits, current_frame_config.max_payload_bytes,
         current_code_rate);
-    let mut turbo_encoder = TurboEncoder::new_with_rate(current_frame_config.fec_block_bits, current_code_rate);
-    let mut turbo_decoder = TurboDecoder::new_with_rate(current_frame_config.fec_block_bits, current_code_rate);
-    turbo_decoder.set_iterations(8);
+    let mut ldpc_encoder = LdpcEncoder::new_with_rate(current_frame_config.fec_block_bits, current_code_rate);
+    let mut ldpc_decoder = LdpcDecoder::new_with_rate(current_frame_config.fec_block_bits, current_code_rate);
+    ldpc_decoder.set_iterations(30);
 
     // Signal metrics
     let mut metrics = SignalMetrics::default();
@@ -1171,9 +1171,9 @@ fn run_modem_processing(
         if speed_level != current_frame_config.level {
             current_frame_config = get_frame_config(speed_level, config.bandwidth);
             current_code_rate = current_frame_config.code_rate;
-            turbo_encoder = TurboEncoder::new_with_rate(current_frame_config.fec_block_bits, current_code_rate);
-            turbo_decoder = TurboDecoder::new_with_rate(current_frame_config.fec_block_bits, current_code_rate);
-            turbo_decoder.set_iterations(8);
+            ldpc_encoder = LdpcEncoder::new_with_rate(current_frame_config.fec_block_bits, current_code_rate);
+            ldpc_decoder = LdpcDecoder::new_with_rate(current_frame_config.fec_block_bits, current_code_rate);
+            ldpc_decoder.set_iterations(30);
 
             // Update FSK modulator/demodulator if mode changes
             // Use new_for_bandwidth to clamp speed level for 500Hz (max mode 13)
@@ -1383,8 +1383,8 @@ fn run_modem_processing(
                         if is_fsk_mode {
                             if let Some(ref mut fsk_demod) = fsk_demodulator {
                                 // Calculate samples needed for full FSK frame
-                                let block_size = turbo_decoder.block_size();
-                                let encoded_bits_expected = current_code_rate.output_bits(block_size) + 16;
+                                let block_size = ldpc_decoder.block_size();
+                                let encoded_bits_expected = current_code_rate.ldpc_output_bits(block_size);
                                 let bits_per_symbol = (fsk_demod.num_tones() as f32).log2() as usize;
                                 let fsk_symbols_needed = (encoded_bits_expected + bits_per_symbol - 1) / bits_per_symbol;
                                 let samples_per_fsk_symbol = (sample_rate / fsk_demod.symbol_rate()) as usize;
@@ -1398,14 +1398,14 @@ fn run_modem_processing(
                                     // FSK demodulation - convert hard bits to pseudo-soft bits
                                     let hard_bits = fsk_demod.demodulate_bits(data_samples);
 
-                                    // Convert hard bits to soft bits for turbo decoder
-                                    // Use +1.0 for bit 0, -1.0 for bit 1 (turbo decoder convention)
+                                    // Convert hard bits to soft bits for LDPC decoder
+                                    // Use +1.0 for bit 0, -1.0 for bit 1 (decoder convention)
                                     let all_soft_bits: Vec<f32> = hard_bits.iter()
                                         .map(|&b| if b == 0 { 1.0 } else { -1.0 })
                                         .collect();
 
                                     if all_soft_bits.len() >= encoded_bits_expected {
-                                        let decoded_bits = turbo_decoder.decode(&all_soft_bits[..encoded_bits_expected]);
+                                        let decoded_bits = ldpc_decoder.decode(&all_soft_bits[..encoded_bits_expected]);
 
                                         let decoded_bytes: Vec<u8> = decoded_bits.chunks(8)
                                             .map(|chunk| {
@@ -1529,7 +1529,7 @@ fn run_modem_processing(
                         }
 
                         // Decode with FEC if we have enough bits for a block
-                        let block_size = turbo_decoder.block_size();
+                        let block_size = ldpc_decoder.block_size();
 
                         // Debug: check soft bit statistics
                         if !all_soft_bits.is_empty() {
@@ -1540,13 +1540,13 @@ fn run_modem_processing(
                                    all_soft_bits.len(), avg, min, max);
                         }
 
-                        // Calculate expected encoded bits based on code rate (plus 16 tail bits)
-                        let encoded_bits_expected = current_code_rate.output_bits(block_size) + 16;
-                        debug!("Demodulated {} soft bits from {} symbols, need {} for turbo decode (rate {:?})",
+                        // Calculate expected encoded bits based on LDPC block size (no tail bits)
+                        let encoded_bits_expected = current_code_rate.ldpc_output_bits(block_size);
+                        debug!("Demodulated {} soft bits from {} symbols, need {} for LDPC decode (rate {:?})",
                                all_soft_bits.len(), num_symbols, encoded_bits_expected, current_code_rate);
                         if all_soft_bits.len() >= encoded_bits_expected {
-                            // Decode turbo code (pass all received bits to decoder which will demux based on rate)
-                            let decoded_bits = turbo_decoder.decode(&all_soft_bits[..encoded_bits_expected]);
+                            // Decode LDPC code
+                            let decoded_bits = ldpc_decoder.decode(&all_soft_bits[..encoded_bits_expected]);
 
                             let decoded_bytes: Vec<u8> = decoded_bits.chunks(8)
                                 .map(|chunk| {
@@ -1556,7 +1556,7 @@ fn run_modem_processing(
                                 })
                                 .collect();
 
-                            debug!("Turbo decoded {} bytes: {:02x?}", decoded_bytes.len(), &decoded_bytes);
+                            debug!("LDPC decoded {} bytes: {:02x?}", decoded_bytes.len(), &decoded_bytes);
 
                             // Parse as frame
                             match Frame::decode(&decoded_bytes) {
@@ -1674,10 +1674,10 @@ fn run_modem_processing(
                             let bits: Vec<u8> = frame_bytes.iter()
                                 .flat_map(|&b| (0..8).rev().map(move |i| (b >> i) & 1))
                                 .collect();
-                            let block_size = turbo_encoder.block_size();
+                            let block_size = ldpc_encoder.block_size();
                             let mut padded_bits = bits.clone();
                             padded_bits.resize(block_size, 0);
-                            let encoded = turbo_encoder.encode(&padded_bits);
+                            let encoded = ldpc_encoder.encode(&padded_bits);
                             let modulated = if is_fsk_mode {
                                 if let Some(ref mut fsk_mod) = fsk_modulator {
                                     fsk_mod.reset();
@@ -1808,16 +1808,16 @@ fn run_modem_processing(
 
                             let frame_bytes = frame.encode();
                             debug!("TX Frame: {} bytes", frame_bytes.len());
-                            // Convert bytes to bits for turbo encoding
+                            // Convert bytes to bits for LDPC encoding
                             let bits: Vec<u8> = frame_bytes.iter()
                                 .flat_map(|&b| (0..8).rev().map(move |i| (b >> i) & 1))
                                 .collect();
                             // Pad to block size
-                            let block_size = turbo_encoder.block_size();
+                            let block_size = ldpc_encoder.block_size();
                             let mut padded_bits = bits.clone();
                             padded_bits.resize(block_size, 0);
-                            let encoded = turbo_encoder.encode(&padded_bits);
-                            debug!("Turbo encoded: {} bits -> {} bits", block_size, encoded.len());
+                            let encoded = ldpc_encoder.encode(&padded_bits);
+                            debug!("LDPC encoded: {} bits -> {} bits", block_size, encoded.len());
                             let modulated = if is_fsk_mode {
                                 if let Some(ref mut fsk_mod) = fsk_modulator {
                                     fsk_mod.reset();
@@ -1933,10 +1933,10 @@ fn run_modem_processing(
                         let bits: Vec<u8> = frame_bytes.iter()
                             .flat_map(|&b| (0..8).rev().map(move |i| (b >> i) & 1))
                             .collect();
-                        let block_size = turbo_encoder.block_size();
+                        let block_size = ldpc_encoder.block_size();
                         let mut padded_bits = bits.clone();
                         padded_bits.resize(block_size, 0);
-                        let encoded = turbo_encoder.encode(&padded_bits);
+                        let encoded = ldpc_encoder.encode(&padded_bits);
                         let modulated = if is_fsk_mode {
                             if let Some(ref mut fsk_mod) = fsk_modulator {
                                 fsk_mod.reset();
@@ -1974,10 +1974,10 @@ fn run_modem_processing(
                         let bits: Vec<u8> = frame_bytes.iter()
                             .flat_map(|&b| (0..8).rev().map(move |i| (b >> i) & 1))
                             .collect();
-                        let block_size = turbo_encoder.block_size();
+                        let block_size = ldpc_encoder.block_size();
                         let mut padded_bits = bits.clone();
                         padded_bits.resize(block_size, 0);
-                        let encoded = turbo_encoder.encode(&padded_bits);
+                        let encoded = ldpc_encoder.encode(&padded_bits);
                         let modulated = if is_fsk_mode {
                             if let Some(ref mut fsk_mod) = fsk_modulator {
                                 fsk_mod.reset();
@@ -2002,10 +2002,10 @@ fn run_modem_processing(
                         let bits: Vec<u8> = frame_bytes.iter()
                             .flat_map(|&b| (0..8).rev().map(move |i| (b >> i) & 1))
                             .collect();
-                        let block_size = turbo_encoder.block_size();
+                        let block_size = ldpc_encoder.block_size();
                         let mut padded_bits = bits.clone();
                         padded_bits.resize(block_size, 0);
-                        let encoded = turbo_encoder.encode(&padded_bits);
+                        let encoded = ldpc_encoder.encode(&padded_bits);
                         let modulated = if is_fsk_mode {
                             if let Some(ref mut fsk_mod) = fsk_modulator {
                                 fsk_mod.reset();
@@ -2030,10 +2030,10 @@ fn run_modem_processing(
                         let bits: Vec<u8> = frame_bytes.iter()
                             .flat_map(|&b| (0..8).rev().map(move |i| (b >> i) & 1))
                             .collect();
-                        let block_size = turbo_encoder.block_size();
+                        let block_size = ldpc_encoder.block_size();
                         let mut padded_bits = bits.clone();
                         padded_bits.resize(block_size, 0);
-                        let encoded = turbo_encoder.encode(&padded_bits);
+                        let encoded = ldpc_encoder.encode(&padded_bits);
                         let modulated = if is_fsk_mode {
                             if let Some(ref mut fsk_mod) = fsk_modulator {
                                 fsk_mod.reset();
@@ -2060,10 +2060,10 @@ fn run_modem_processing(
                     let bits: Vec<u8> = frame_bytes.iter()
                         .flat_map(|&b| (0..8).rev().map(move |i| (b >> i) & 1))
                         .collect();
-                    let block_size = turbo_encoder.block_size();
+                    let block_size = ldpc_encoder.block_size();
                     let mut padded_bits = bits.clone();
                     padded_bits.resize(block_size, 0);
-                    let encoded = turbo_encoder.encode(&padded_bits);
+                    let encoded = ldpc_encoder.encode(&padded_bits);
                     let modulated = if is_fsk_mode {
                         if let Some(ref mut fsk_mod) = fsk_modulator {
                             fsk_mod.reset();
