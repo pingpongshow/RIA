@@ -3,6 +3,7 @@
 //! Defines the RIA frame format for data transmission
 
 use crate::fec::crc32;
+use crate::protocol::rate::FrameSize;
 
 /// Frame types
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -69,7 +70,9 @@ impl TryFrom<u8> for FrameType {
 ///
 /// Rate negotiation uses:
 /// - `speed_level`: Proposed mode based on SNR (what sender thinks mode should be)
-/// - `flags`: Measured SNR as i8 (what sender measured on received frames from peer)
+/// - `flags`: Combined field with frame size and SNR:
+///   - Bits 7-6: FrameSize (0=Short, 1=Medium, 2=Standard, 3=Long)
+///   - Bits 5-0: Measured SNR as signed 6-bit value (-32 to +31 dB)
 #[derive(Debug, Clone)]
 pub struct FrameHeader {
     /// Protocol version
@@ -82,7 +85,7 @@ pub struct FrameHeader {
     pub session_id: u16,
     /// Speed level / proposed mode (1-17) for rate negotiation
     pub speed_level: u8,
-    /// Flags / measured SNR (as i8) for rate negotiation
+    /// Combined flags: upper 2 bits = FrameSize, lower 6 bits = SNR (-32 to +31)
     pub flags: u8,
 }
 
@@ -136,14 +139,34 @@ impl FrameHeader {
         })
     }
 
-    /// Get measured SNR from flags field (for rate negotiation)
+    /// Get measured SNR from flags field (lower 6 bits, signed)
+    /// Range: -32 to +31 dB
     pub fn measured_snr(&self) -> i8 {
-        self.flags as i8
+        let raw = self.flags & 0x3F;
+        if raw & 0x20 != 0 {
+            // Negative: sign extend from 6-bit to 8-bit
+            (raw | 0xC0) as i8
+        } else {
+            raw as i8
+        }
     }
 
-    /// Set measured SNR in flags field (for rate negotiation)
+    /// Set measured SNR in flags field (lower 6 bits)
+    /// Clamps to range -32 to +31 dB
     pub fn set_measured_snr(&mut self, snr: i8) {
-        self.flags = snr as u8;
+        let clamped = snr.clamp(-32, 31);
+        let snr_bits = (clamped as u8) & 0x3F;
+        self.flags = (self.flags & 0xC0) | snr_bits;
+    }
+
+    /// Get frame size from flags field (upper 2 bits)
+    pub fn frame_size(&self) -> FrameSize {
+        FrameSize::from_bits(self.flags >> 6)
+    }
+
+    /// Set frame size in flags field (upper 2 bits)
+    pub fn set_frame_size(&mut self, size: FrameSize) {
+        self.flags = (size.to_bits() << 6) | (self.flags & 0x3F);
     }
 
     /// Get proposed mode (alias for speed_level, for rate negotiation)
@@ -389,7 +412,7 @@ impl FrameBuilder {
             sequence: 0,
             session_id: 0,
             speed_level: 9,
-            flags: 0,
+            flags: 0x80, // Default to Standard frame size (2 << 6 = 0x80)
             payload: Vec::new(),
         }
     }
@@ -412,9 +435,23 @@ impl FrameBuilder {
         self
     }
 
-    /// Set flags
+    /// Set flags (raw byte)
     pub fn flags(mut self, flags: u8) -> Self {
         self.flags = flags;
+        self
+    }
+
+    /// Set frame size (upper 2 bits of flags)
+    pub fn frame_size(mut self, size: FrameSize) -> Self {
+        self.flags = (size.to_bits() << 6) | (self.flags & 0x3F);
+        self
+    }
+
+    /// Set measured SNR (lower 6 bits of flags)
+    pub fn measured_snr(mut self, snr: i8) -> Self {
+        let clamped = snr.clamp(-32, 31);
+        let snr_bits = (clamped as u8) & 0x3F;
+        self.flags = (self.flags & 0xC0) | snr_bits;
         self
     }
 
@@ -482,5 +519,78 @@ mod tests {
         assert_eq!(frame.sequence(), 100);
         assert_eq!(frame.session_id(), 999);
         assert_eq!(frame.header.speed_level, 12);
+    }
+
+    #[test]
+    fn test_frame_size_encoding() {
+        let mut header = FrameHeader::new(FrameType::Data, 0, 0);
+
+        header.set_frame_size(FrameSize::Short);
+        assert_eq!(header.frame_size(), FrameSize::Short);
+
+        header.set_frame_size(FrameSize::Medium);
+        assert_eq!(header.frame_size(), FrameSize::Medium);
+
+        header.set_frame_size(FrameSize::Standard);
+        assert_eq!(header.frame_size(), FrameSize::Standard);
+
+        header.set_frame_size(FrameSize::Long);
+        assert_eq!(header.frame_size(), FrameSize::Long);
+    }
+
+    #[test]
+    fn test_snr_encoding() {
+        let mut header = FrameHeader::new(FrameType::Data, 0, 0);
+
+        header.set_measured_snr(15);
+        assert_eq!(header.measured_snr(), 15);
+
+        header.set_measured_snr(-10);
+        assert_eq!(header.measured_snr(), -10);
+
+        header.set_measured_snr(31);
+        assert_eq!(header.measured_snr(), 31);
+
+        header.set_measured_snr(-32);
+        assert_eq!(header.measured_snr(), -32);
+
+        // Test clamping
+        header.set_measured_snr(100);
+        assert_eq!(header.measured_snr(), 31);
+
+        header.set_measured_snr(-100);
+        assert_eq!(header.measured_snr(), -32);
+    }
+
+    #[test]
+    fn test_combined_flags_encoding() {
+        let mut header = FrameHeader::new(FrameType::Data, 0, 0);
+
+        header.set_frame_size(FrameSize::Long);
+        header.set_measured_snr(20);
+
+        assert_eq!(header.frame_size(), FrameSize::Long);
+        assert_eq!(header.measured_snr(), 20);
+
+        header.set_measured_snr(-15);
+        assert_eq!(header.frame_size(), FrameSize::Long);
+        assert_eq!(header.measured_snr(), -15);
+
+        header.set_frame_size(FrameSize::Short);
+        assert_eq!(header.frame_size(), FrameSize::Short);
+        assert_eq!(header.measured_snr(), -15);
+    }
+
+    #[test]
+    fn test_frame_builder_with_frame_size() {
+        let frame = FrameBuilder::new(FrameType::Data)
+            .sequence(1)
+            .session_id(100)
+            .frame_size(FrameSize::Long)
+            .measured_snr(25)
+            .build();
+
+        assert_eq!(frame.header.frame_size(), FrameSize::Long);
+        assert_eq!(frame.header.measured_snr(), 25);
     }
 }

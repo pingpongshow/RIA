@@ -13,9 +13,9 @@ mod encryption;
 pub use frame::{Frame, FrameType, FrameHeader, FrameBuilder};
 #[allow(unused_imports)]
 pub use arq::{ArqController, ArqState, ArqConfig, ArqStats};
-pub use session::{Session, SessionState, SessionConfig, SessionEvent};
+pub use session::{Session, SessionState, SessionConfig, SessionEvent, FrameSizeNegotiator};
 #[allow(unused_imports)]
-pub use rate::{RateAdapter, RateInfo, RateAdapterConfig, FftSize, ModulationType, all_rate_info, FrameConfig, get_frame_config, max_mode_for_bandwidth, clamp_mode_for_bandwidth, RateNegotiator, NegotiationState, ModeThreshold, MODE_THRESHOLDS, calculate_proposed_mode, get_mode_threshold};
+pub use rate::{RateAdapter, RateInfo, RateAdapterConfig, FftSize, ModulationType, all_rate_info, FrameConfig, get_frame_config, max_mode_for_bandwidth, clamp_mode_for_bandwidth, RateNegotiator, NegotiationState, ModeThreshold, MODE_THRESHOLDS, calculate_proposed_mode, get_mode_threshold, FrameSize, SlidingFrameConfig, get_sliding_frame_config};
 #[allow(unused_imports)]
 pub use encryption::{Encryptor, EncryptionConfig, EncryptionError};
 

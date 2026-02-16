@@ -1,10 +1,11 @@
 //! Modem module - modulation and demodulation
 //!
-//! Implements OFDM data modulation, MFSK header modulation, and 48-FSK ACK frames
+//! Implements STANAG 39-tone DQPSK data modulation, MFSK header modulation, and 48-FSK ACK frames
 
 mod preamble;
 mod mfsk;
 mod ofdm;
+mod stanag;
 mod constellation;
 mod sync;
 mod ack_fsk;
@@ -16,7 +17,9 @@ pub use preamble::{Preamble, PreambleDetector, PreambleMode, FastPreambleDetecto
 pub use preamble::{BARKER_5, BARKER_7, BARKER_11, BARKER_13};
 #[allow(unused_imports)]
 pub use mfsk::{MfskModulator, MfskDemodulator};
+#[allow(unused_imports)]
 pub use ofdm::{OfdmModulator, OfdmDemodulator, OfdmConfig};
+pub use stanag::{StanagModulator, StanagDemodulator, StanagConfig};
 pub use constellation::{Constellation, ConstellationType};
 #[allow(unused_imports)]
 pub use sync::{SymbolSync, TimingRecovery};
