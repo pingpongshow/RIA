@@ -4,7 +4,7 @@
 
 *Last updated: 2026-02-24*
 
-> **EXPERIMENTAL SOFTWARE - NON-COMMERCIAL USE ONLY**
+> **NON-COMMERCIAL USE ONLY**
 >
 > This project is under active development and is **not ready for production use**.
 > Features may be incomplete, untested, or broken. APIs and protocols may change
