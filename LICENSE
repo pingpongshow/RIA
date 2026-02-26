@@ -1,0 +1,135 @@
+# RIA Modem License
+
+**Copyright (c) 2026 Stephen Packer. All Rights Reserved.**
+
+---
+
+## LICENSE RETENTION REQUIREMENT
+
+**This LICENSE file must be included, unmodified, in all copies, forks, branches, derivatives, and distributions of this Software.** Any modified versions must clearly indicate that changes were made and must not remove or alter this license. Failure to include this license constitutes a violation of the terms and terminates all rights granted herein.
+
+---
+
+## NON-COMMERCIAL USE ONLY
+
+This software, the RIA Modem ("Software"), is provided for **non-commercial, personal, educational, and amateur radio experimentation purposes only**.
+
+### You MAY:
+- Use this Software for personal amateur radio communications
+- Use this Software for educational and research purposes
+- Modify the Software for personal use
+- Share modifications with other non-commercial users under the same terms
+
+### You MAY NOT:
+- Use this Software for any commercial purpose
+- Sell, lease, or rent this Software or any derivative works
+- Use this Software in any commercial product or service
+- Use this Software to provide commercial services to third parties
+- Remove or alter any copyright notices or this license
+
+---
+
+## THIRD-PARTY TECHNOLOGIES
+
+This Software incorporates or implements various signal processing, coding, and communication technologies. These technologies, algorithms, and methods may be covered by patents, copyrights, or other intellectual property rights held by their respective owners.
+
+**Technologies implemented include but are not limited to:**
+- LDPC (Low-Density Parity-Check) codes based on IEEE 802.11n specifications
+- OFDM (Orthogonal Frequency Division Multiplexing)
+- Zadoff-Chu sequences
+- Chirp spread spectrum synchronization
+- HARQ (Hybrid Automatic Repeat Request) with chase combining
+- Various modulation schemes (DPSK, QAM, etc.)
+
+**Third-party libraries included:**
+- Dear ImGui (MIT License) - See `thirdparty/imgui/LICENSE.txt`
+- miniz (Public Domain) - See `thirdparty/miniz/`
+- SDL2 (zlib License) - System dependency
+- FFTW3 (GPL or commercial) - System dependency
+
+See `LICENSE_THIRDPARTY.md` for additional third-party attribution.
+
+---
+
+## ENCRYPTION NOTICE
+
+This Software includes AES-256 encryption capabilities.
+
+### IMPORTANT LEGAL NOTICE:
+
+1. **Amateur Radio Regulations**: Many jurisdictions prohibit or restrict the use of encryption on amateur radio frequencies. In the United States, FCC Part 97.113(a)(4) generally prohibits messages encoded for the purpose of obscuring their meaning on amateur frequencies. Check your local regulations before enabling encryption.
+
+2. **Export Controls**: Encryption software may be subject to export control regulations including the U.S. Export Administration Regulations (EAR). Users are responsible for compliance with all applicable export laws and regulations.
+
+3. **Lawful Use Only**: The encryption features are intended for lawful purposes such as:
+   - Testing and development on closed systems
+   - Use on frequencies where encryption is permitted
+   - Emergency communications where authorized
+   - Non-RF loopback testing
+
+4. **No Warranty of Security**: While AES-256 is a strong encryption standard, no guarantee is made regarding the security or suitability of this implementation for any particular purpose.
+
+**By using the encryption features, you accept sole responsibility for compliance with all applicable laws and regulations.**
+
+---
+
+## DISCLAIMER OF WARRANTY
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY, FITNESS FOR A PARTICULAR PURPOSE, AND NONINFRINGEMENT.
+
+**SPECIFICALLY:**
+
+1. **No Performance Guarantee**: No guarantee is made that this Software will achieve any particular data rate, reliability, or performance level under any conditions.
+
+2. **Experimental Software**: This Software is experimental and under active development. Features may be incomplete, contain bugs, or change without notice.
+
+3. **No Radio Compliance Guarantee**: While designed for amateur radio use, no guarantee is made that transmissions comply with any regulatory requirements. Users are responsible for ensuring compliance with all applicable radio regulations.
+
+4. **No Interference Guarantee**: No guarantee is made that this Software will not cause harmful interference to other radio services or systems.
+
+5. **Hardware Risk**: Use of this Software with radio equipment is at your own risk. No liability is accepted for any damage to radio equipment, computers, or other hardware.
+
+---
+
+## LIMITATION OF LIABILITY
+
+IN NO EVENT SHALL THE AUTHORS, COPYRIGHT HOLDERS, OR CONTRIBUTORS BE LIABLE FOR ANY CLAIM, DAMAGES, OR OTHER LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT, OR OTHERWISE, ARISING FROM, OUT OF, OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
+
+This includes but is not limited to:
+- Direct, indirect, incidental, special, exemplary, or consequential damages
+- Loss of data, profits, or business opportunities
+- Equipment damage or failure
+- Regulatory fines or penalties
+- Any claims by third parties
+
+---
+
+## AMATEUR RADIO USE
+
+This Software is designed for use by licensed amateur radio operators. Users must:
+
+1. Hold a valid amateur radio license for their jurisdiction
+2. Comply with all applicable amateur radio regulations
+3. Identify transmissions with their assigned callsign as required by law
+4. Operate within authorized frequency bands and power limits
+5. Not cause harmful interference to other radio services
+
+---
+
+## ACCEPTANCE
+
+By using, copying, or distributing this Software, you acknowledge that you have read, understood, and agree to be bound by the terms of this license.
+
+If you do not agree to these terms, you must not use, copy, or distribute this Software.
+
+---
+
+## CONTACT
+
+For licensing inquiries, commercial use requests, or other questions:
+- Open an issue on the project repository
+- Contact the copyright holder directly
+
+---
+
+*Last updated: 2026-02-24*

@@ -1,0 +1,181 @@
+#pragma once
+
+#include <cstdio>
+#include <cstdarg>
+#include <chrono>
+#ifdef _WIN32
+#ifndef NOMINMAX
+#define NOMINMAX
+#endif
+#include <io.h>
+#include <windows.h>
+#else
+#include <mutex>
+#endif
+
+// Windows headers define ERROR as a macro - undefine it
+#ifdef ERROR
+#undef ERROR
+#endif
+
+namespace ultra {
+
+// Start time for relative timestamps
+inline auto g_log_start_time = std::chrono::steady_clock::now();
+
+// Log output file (nullptr = stderr)
+inline FILE* g_log_file = nullptr;
+#ifdef _WIN32
+inline SRWLOCK g_log_lock = SRWLOCK_INIT;
+#else
+inline std::mutex g_log_mutex;
+#endif
+
+// Thread-local station tag for multi-station debug (e.g. "ALPHA" or "BRAVO")
+inline thread_local const char* g_log_station_tag = nullptr;
+
+inline void setLogStationTag(const char* tag) { g_log_station_tag = tag; }
+
+// Log levels
+enum class LogLevel {
+    NONE = 0,
+    ERROR = 1,
+    WARN = 2,
+    INFO = 3,
+    DEBUG = 4,
+    TRACE = 5
+};
+
+// Global log level - can be changed at runtime
+// Default to INFO for release, DEBUG for debug builds
+#ifdef NDEBUG
+inline LogLevel g_log_level = LogLevel::INFO;
+#else
+inline LogLevel g_log_level = LogLevel::DEBUG;
+#endif
+
+// Log category enable flags for fine-grained control
+struct LogCategories {
+    bool demod = true;      // Demodulator
+    bool modem = true;      // Modem engine
+    bool ldpc = false;      // LDPC codec (very verbose)
+    bool sync = true;       // Sync detection
+    bool channel = false;   // Channel estimation
+};
+
+inline LogCategories g_log_categories;
+
+// Set log level
+inline void setLogLevel(LogLevel level) {
+    g_log_level = level;
+}
+
+// Set log output file (call with nullptr to use stderr)
+inline void setLogFile(FILE* file) {
+#ifdef _WIN32
+    AcquireSRWLockExclusive(&g_log_lock);
+    g_log_file = file;
+    ReleaseSRWLockExclusive(&g_log_lock);
+#else
+    std::lock_guard<std::mutex> lock(g_log_mutex);
+    g_log_file = file;
+#endif
+}
+
+// Core logging function
+inline void log(LogLevel level, const char* category, const char* format, ...) {
+    if (level > g_log_level) return;
+
+#ifdef _WIN32
+    AcquireSRWLockShared(&g_log_lock);
+    FILE* out = g_log_file;  // No stderr fallback on GUI subsystem builds.
+    if (!out) {
+        ReleaseSRWLockShared(&g_log_lock);
+        return;
+    }
+#else
+    std::lock_guard<std::mutex> lock(g_log_mutex);
+    FILE* out = g_log_file ? g_log_file : stderr;
+#endif
+
+    // Get elapsed time in milliseconds
+    auto now = std::chrono::steady_clock::now();
+    auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(now - g_log_start_time).count();
+    int secs = static_cast<int>(elapsed / 1000);
+    int ms = static_cast<int>(elapsed % 1000);
+
+    const char* level_str = "";
+    switch (level) {
+        case LogLevel::ERROR: level_str = "ERROR"; break;
+        case LogLevel::WARN:  level_str = "WARN "; break;
+        case LogLevel::INFO:  level_str = "INFO "; break;
+        case LogLevel::DEBUG: level_str = "DEBUG"; break;
+        case LogLevel::TRACE: level_str = "TRACE"; break;
+        default: break;
+    }
+
+    if (g_log_station_tag && g_log_station_tag[0]) {
+        fprintf(out, "[%3d.%03d][%s][%s] [%s] ", secs, ms, level_str, category, g_log_station_tag);
+    } else {
+        fprintf(out, "[%3d.%03d][%s][%s] ", secs, ms, level_str, category);
+    }
+
+    va_list args;
+    va_start(args, format);
+    vfprintf(out, format, args);
+    va_end(args);
+
+    fprintf(out, "\n");
+    fflush(out);
+#ifdef _WIN32
+    ReleaseSRWLockShared(&g_log_lock);
+#endif
+}
+
+// Convenience macros - these compile to nothing when ULTRA_LOG_DISABLE is defined
+#ifdef ULTRA_LOG_DISABLE
+
+#define LOG_ERROR(cat, fmt, ...)
+#define LOG_WARN(cat, fmt, ...)
+#define LOG_INFO(cat, fmt, ...)
+#define LOG_DEBUG(cat, fmt, ...)
+#define LOG_TRACE(cat, fmt, ...)
+
+#else
+
+#define LOG_ERROR(cat, fmt, ...) \
+    ultra::log(ultra::LogLevel::ERROR, cat, fmt, ##__VA_ARGS__)
+
+#define LOG_WARN(cat, fmt, ...) \
+    ultra::log(ultra::LogLevel::WARN, cat, fmt, ##__VA_ARGS__)
+
+#define LOG_INFO(cat, fmt, ...) \
+    ultra::log(ultra::LogLevel::INFO, cat, fmt, ##__VA_ARGS__)
+
+#define LOG_DEBUG(cat, fmt, ...) \
+    do { if (ultra::g_log_level >= ultra::LogLevel::DEBUG) \
+        ultra::log(ultra::LogLevel::DEBUG, cat, fmt, ##__VA_ARGS__); } while(0)
+
+#define LOG_TRACE(cat, fmt, ...) \
+    do { if (ultra::g_log_level >= ultra::LogLevel::TRACE) \
+        ultra::log(ultra::LogLevel::TRACE, cat, fmt, ##__VA_ARGS__); } while(0)
+
+#endif
+
+// Category-specific logging macros
+#define LOG_DEMOD(level, fmt, ...) \
+    do { if (ultra::g_log_categories.demod) LOG_##level("DEMOD", fmt, ##__VA_ARGS__); } while(0)
+
+#define LOG_MODEM(level, fmt, ...) \
+    do { if (ultra::g_log_categories.modem) LOG_##level("MODEM", fmt, ##__VA_ARGS__); } while(0)
+
+#define LOG_LDPC(level, fmt, ...) \
+    do { if (ultra::g_log_categories.ldpc) LOG_##level("LDPC", fmt, ##__VA_ARGS__); } while(0)
+
+#define LOG_SYNC(level, fmt, ...) \
+    do { if (ultra::g_log_categories.sync) LOG_##level("SYNC", fmt, ##__VA_ARGS__); } while(0)
+
+#define LOG_CHAN(level, fmt, ...) \
+    do { if (ultra::g_log_categories.channel) LOG_##level("CHAN", fmt, ##__VA_ARGS__); } while(0)
+
+} // namespace ultra
