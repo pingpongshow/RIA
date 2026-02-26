@@ -77,6 +77,7 @@ RIA Modem is a software modem that achieves reliable, high-speed data transfer o
 | 20+ dB | OFDM QPSK R1/2 | 47 (12 pilots) | 2014 bps | Coherent path, sensitive to phase/fading |
 | 25+ dB | OFDM 16QAM R3/4 | 44 (15 pilots) | 5657 bps | Stable paths (NVIS, ground wave) |
 | 30+ dB | OFDM 32QAM R3/4 | 44 (15 pilots) | **7071 bps** | Maximum throughput |
+|        | OFDM 64QAM      |                |              | Unlikely to be used on HF |
 
 **When to use coherent modes (16QAM/32QAM):** Stable propagation paths like
 ground wave or direct cable connection. These paths have stable phase, allowing
@@ -243,23 +244,6 @@ cd build
 ctest
 ```
 
-**CFO Verification (Internal Pre/Post Correction Chain):**
-
-```bash
-# From repository root (one-command gate)
-./tests/verify_cfo_chain.sh --cfo 50 --channel awgn --snr 20 --seed 42
-
-# Optional: capture raw TX/RX audio for offline analysis
-./build/cli_simulator --snr 20 --channel awgn --waveform ofdm_chirp \
-  --mod dqpsk --rate r1_2 --tx-cfo 50 \
-  --save-signals 1 --save-prefix /tmp/cfo_probe --test
-```
-
-Useful `cli_simulator` flags for CFO diagnostics:
-- `--tx-cfo` (alias `--cfo`) injects TX CFO in Hz across the full transmitted signal.
-- `--save-signals [N]` writes raw TX/RX captures for up to `N` messages.
-- `--save-prefix <path>` and `--save-max-samples <N>` control capture naming and size.
-
 **Adaptive Advisory Smoke Test (log-only, no live MODE_CHANGE yet):**
 
 ```bash
@@ -347,7 +331,7 @@ power necessary. Be ready to QSY if causing interference.
 
 ## Current Status
 
-> **Note**: Core waveforms have been verified in loopback and acoustic testing.
+> **Note**: Core waveforms have been verified in audio loopback.
 > On-air HF testing is in progress.
 
 ### What Is Solid Today
@@ -370,17 +354,12 @@ power necessary. Be ready to QSY if causing interference.
 
 ### Use With Caution (Experimental)
 
-- D8PSK in fading: data decode can be strong, but end-to-end reliability remains more variable than DQPSK baseline.
 - Coherent modes (QPSK/16QAM/32QAM): suitable for stable high-SNR paths, not the default for difficult HF fading.
 - High-rate operation (`R2/3+`) still depends on channel quality and control-path stability.
 
 ### Active Work
 
-- Control-path hardening under deep fades (ACK/SACK diversity and timeout tuning).
-- Advisory hysteresis is implemented and testable in simulator logs; next step is wiring controlled live `MODE_CHANGE` policy.
-- Continued OTA multi-station validation and log-driven fixes.
-
----
+OTA testing ang bug fixes
 
 ## Research Roadmap
 
@@ -421,72 +400,7 @@ RIA Modem is a research platform for investigating advanced modulation and codin
 
 ### How to Contribute
 
-We're looking for collaborators interested in:
-- Implementing AFDM modulation
-- Adding turbo processing to DPSK
-- Testing OTFS on real HF recordings
-- SC-LDPC code design and optimization
-- FTN with iterative ISI cancellation
-
-If you have expertise in these areas, please open an issue or reach out!
-
----
-
-## Contributing
-
-Contributions welcome! Areas of interest:
-
-- On-air testing and performance reports
-- Documentation and tutorials
-- Bug fixes and optimizations
-
-Please open an issue before submitting large PRs.
-
-### Help Wanted: Real HF Recordings
-
-**We need real-world HF recordings to validate the modem beyond simulation.**
-
-If you're a licensed amateur radio operator, you can help by recording your own
-transmissions via WebSDR. This is legitimate amateur experimentation under
-FCC Part 97 (advancement of the radio art).
-
-**How to record your own signal:**
-
-1. Pick a frequency from the recommended list above (e.g., 14.108 MHz USB)
-2. Open a WebSDR receiver (websdr.org or kiwisdr.com) and tune to that frequency
-3. Start recording on the WebSDR (or use Audacity to capture system audio)
-4. Transmit using RIA Modem (see options below)
-5. Stop recording and save the file
-
-**What to transmit:**
-
-| Frame Type | Duration | Best For |
-|------------|----------|----------|
-| **PING probe** | ~1 second | Quick propagation test |
-| **Full CONNECT** | ~8 seconds | Complete handshake test |
-
-- **PING probe**: Short DPSK burst with "ULTR" marker. Fast way to check if your
-  signal is reaching the WebSDR. In GUI: click Connect, recording starts immediately
-  with the PING. Cancel after 2-3 seconds if you just want the probe.
-
-- **Full CONNECT**: Complete connection attempt with callsign exchange (3 codewords).
-  More comprehensive test of sync, LDPC decode, and protocol parsing.
-
-**What to submit:**
-- Recording file (48kHz mono WAV or F32 preferred)
-- Your callsign and transmit location
-- Band/frequency and time (UTC)
-- WebSDR location used (e.g., "Twente WebSDR, Netherlands")
-- Approximate path distance
-- Band conditions if known (S-meter readings)
-- Frame type transmitted (PING or CONNECT)
-
-**Why this helps:**
-Real ionospheric propagation has characteristics that simulation can't capture.
-Even "failed" recordings where the signal didn't decode are valuable - they
-help us improve sync detection and weak-signal performance.
-
-**How to submit:** Open a GitHub issue with the "Recording" label.
+TESTING
 
 ---
 
@@ -552,7 +466,7 @@ Third-party attributions: See [LICENSE_THIRDPARTY.md](LICENSE_THIRDPARTY.md)
 
 ## Acknowledgments
 
-- Community OTA testers, especially **KC3VPB**, for sharing real-station logs (`receiver_latest_gui.log` / `init_latest_gui.log`) that helped diagnose post-handshake sync rejects and buffer-overflow edge cases.
+- ProjectUltra
 - [Dear ImGui](https://github.com/ocornut/imgui) - GUI framework
 - [SDL2](https://libsdl.org/) - Audio and windowing
 - [FFTW3](https://www.fftw.org/) - Fast Fourier Transform (required for chirp detection)
