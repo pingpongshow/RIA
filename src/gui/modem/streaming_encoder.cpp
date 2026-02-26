@@ -1,0 +1,872 @@
+// StreamingEncoder - Unified TX encoder for all waveform types
+//
+// Mirrors StreamingDecoder to ensure TX/RX use identical configurations.
+
+#include "streaming_encoder.hpp"
+#include "waveform/ofdm_chirp_waveform.hpp"
+#include "waveform/ofdm_cox_waveform.hpp"
+#include "waveform/mc_dpsk_waveform.hpp"
+#include "waveform/mfsk_waveform.hpp"
+#include "fec/frame_interleaver.hpp"
+#include "fec/burst_interleaver.hpp"
+#include "gui/startup_trace.hpp"
+#include "ultra/logging.hpp"
+#include <algorithm>
+
+namespace ultra {
+namespace gui {
+
+namespace v2 = protocol::v2;
+
+namespace {
+
+bool isControlFrameBytes(const Bytes& frame_data) {
+    if (frame_data.size() < 3) {
+        return false;
+    }
+    auto ft = static_cast<v2::FrameType>(frame_data[2]);
+    return v2::isControlFrame(ft);
+}
+
+}  // namespace
+
+// ============================================================================
+// CONSTRUCTION / DESTRUCTION
+// ============================================================================
+
+StreamingEncoder::StreamingEncoder() {
+    startupTrace("StreamingEncoder", "ctor-enter");
+
+    // Initialize with default OFDM config (NVIS mode)
+    ofdm_config_.fft_size = 1024;
+    ofdm_config_.num_carriers = 59;
+    ofdm_config_.sample_rate = 48000;
+    ofdm_config_.center_freq = 1500.0f;
+    ofdm_config_.cp_mode = CyclicPrefixMode::LONG;
+    ofdm_config_.modulation = Modulation::DQPSK;
+    ofdm_config_.code_rate = CodeRate::R1_4;
+    ofdm_config_.use_pilots = true;
+    ofdm_config_.pilot_spacing = 10;
+    startupTrace("StreamingEncoder", "defaults-set");
+
+    // Create default MC-DPSK waveform
+    startupTrace("StreamingEncoder", "create-waveform-enter");
+    createWaveform();
+    startupTrace("StreamingEncoder", "create-waveform-exit");
+    startupTrace("StreamingEncoder", "update-interleaver-enter");
+    updateInterleaver();
+    startupTrace("StreamingEncoder", "update-interleaver-exit");
+
+    // Initialize CSS sync for frame-type encoding (optional, disabled by default)
+    sync::CSSConfig css_config;
+    css_config.sample_rate = 48000.0f;
+    css_config.f_start = 300.0f;
+    css_config.f_end = 2700.0f;
+    css_config.duration_ms = 500.0f;  // Match chirp duration
+    css_config.gap_ms = 100.0f;
+    css_config.num_shifts = 4;  // PING, PONG, DATA, CONTROL
+    css_config.num_chirps = 1;  // Single chirp for frame type (up-chirp is separate)
+    css_sync_ = std::make_unique<sync::CSSSync>(css_config);
+    startupTrace("StreamingEncoder", "css-sync-created");
+
+    startupTrace("StreamingEncoder", "ctor-log-enter");
+    LOG_MODEM(INFO, "StreamingEncoder: Initialized (mode=%s, carriers=%d, css=%s)",
+              protocol::waveformModeToString(mode_), ofdm_config_.num_carriers,
+              css_enabled_ ? "enabled" : "disabled");
+    startupTrace("StreamingEncoder", "ctor-log-exit");
+    startupTrace("StreamingEncoder", "ctor-exit");
+}
+
+StreamingEncoder::~StreamingEncoder() = default;
+
+void StreamingEncoder::setBurstInterleaveGroupSize(int size) {
+    burst_group_size_ = std::clamp(size, 2, 8);
+}
+
+// ============================================================================
+// MODE CONTROL
+// ============================================================================
+
+void StreamingEncoder::setMode(protocol::WaveformMode mode) {
+    if (mode_ == mode) return;
+
+    mode_ = mode;
+    createWaveform();
+    updateInterleaver();
+
+    LOG_MODEM(INFO, "[%s] Mode changed to %s",
+              log_prefix_.c_str(), protocol::waveformModeToString(mode));
+}
+
+void StreamingEncoder::setDataMode(Modulation mod, CodeRate rate) {
+    if (modulation_ == mod && code_rate_ == rate) return;
+
+    modulation_ = mod;
+    code_rate_ = rate;
+    ofdm_config_.modulation = mod;
+    ofdm_config_.code_rate = rate;
+
+    // Update waveform configuration
+    if (waveform_) {
+        waveform_->configure(mod, rate);
+        // Sync pilot_spacing from waveform (coherent modes use denser pilots)
+        int spacing = waveform_->getPilotSpacing();
+        if (spacing > 0) ofdm_config_.pilot_spacing = spacing;
+    }
+
+    // Update interleaver (bits_per_symbol may change with modulation)
+    updateInterleaver();
+
+    LOG_MODEM(INFO, "[%s] Data mode: %s R%s",
+              log_prefix_.c_str(),
+              mod == Modulation::DBPSK ? "DBPSK" :
+              mod == Modulation::DQPSK ? "DQPSK" :
+              mod == Modulation::D8PSK ? "D8PSK" :
+              mod == Modulation::QAM16 ? "QAM16" :
+              mod == Modulation::QAM32 ? "QAM32" :
+              mod == Modulation::QAM64 ? "QAM64" : "other",
+              rate == CodeRate::R1_4 ? "1/4" :
+              rate == CodeRate::R1_2 ? "1/2" :
+              rate == CodeRate::R2_3 ? "2/3" :
+              rate == CodeRate::R3_4 ? "3/4" : "other");
+}
+
+void StreamingEncoder::setOFDMConfig(const ModemConfig& config) {
+    ofdm_config_ = config;
+    modulation_ = config.modulation;
+    code_rate_ = config.code_rate;
+
+    // Recreate waveform with new config
+    createWaveform();
+    updateInterleaver();
+
+    LOG_MODEM(INFO, "[%s] OFDM config updated: FFT=%d, carriers=%d, pilots=%s spacing=%d",
+              log_prefix_.c_str(), config.fft_size, config.num_carriers,
+              config.use_pilots ? "yes" : "no", config.pilot_spacing);
+}
+
+void StreamingEncoder::setMCDPSKCarriers(int num_carriers) {
+    if (mc_dpsk_carriers_ == num_carriers) return;
+
+    mc_dpsk_carriers_ = num_carriers;
+
+    // Recreate waveform if currently in MC-DPSK mode
+    if (mode_ == protocol::WaveformMode::MC_DPSK) {
+        createWaveform();
+    }
+
+    // Always update control waveform
+    control_waveform_ = WaveformFactory::createMCDPSK(num_carriers);
+    // Apply spreading mode to new control waveform
+    if (spreading_mode_ != SpreadingMode::NONE && control_waveform_) {
+        auto* mc_dpsk = dynamic_cast<MCDPSKWaveform*>(control_waveform_.get());
+        if (mc_dpsk) {
+            mc_dpsk->setSpreadingMode(spreading_mode_);
+        }
+    }
+    updateInterleaver();
+
+    LOG_MODEM(INFO, "[%s] MC-DPSK carriers: %d", log_prefix_.c_str(), num_carriers);
+}
+
+void StreamingEncoder::setMCDPSKChannelInterleave(bool enable) {
+    if (use_mc_dpsk_channel_interleave_ == enable) return;
+    use_mc_dpsk_channel_interleave_ = enable;
+    updateInterleaver();
+    LOG_MODEM(INFO, "[%s] MC-DPSK DATA channel interleave: %s",
+              log_prefix_.c_str(), enable ? "ENABLED" : "disabled");
+}
+
+void StreamingEncoder::setSpreadingMode(SpreadingMode mode) {
+    if (spreading_mode_ == mode) return;
+    spreading_mode_ = mode;
+
+    // Apply to MC-DPSK waveform if that's the current mode
+    if (mode_ == protocol::WaveformMode::MC_DPSK && waveform_) {
+        auto* mc_dpsk = dynamic_cast<MCDPSKWaveform*>(waveform_.get());
+        if (mc_dpsk) {
+            mc_dpsk->setSpreadingMode(mode);
+        }
+    }
+
+    // Apply to control waveform (always MC-DPSK)
+    if (control_waveform_) {
+        auto* mc_dpsk = dynamic_cast<MCDPSKWaveform*>(control_waveform_.get());
+        if (mc_dpsk) {
+            mc_dpsk->setSpreadingMode(mode);
+        }
+    }
+
+    LOG_MODEM(INFO, "[%s] Spreading mode: %s",
+              log_prefix_.c_str(),
+              mode == SpreadingMode::TIME_4X ? "4×" :
+              mode == SpreadingMode::TIME_2X ? "2×" : "NONE");
+}
+
+// ============================================================================
+// ENCODING
+// ============================================================================
+
+std::vector<float> StreamingEncoder::encodeFrame(const Bytes& frame_data) {
+    if (!waveform_) {
+        LOG_MODEM(ERROR, "[%s] No waveform!", log_prefix_.c_str());
+        return {};
+    }
+
+    bool is_ofdm = (mode_ == protocol::WaveformMode::OFDM_CHIRP ||
+                    mode_ == protocol::WaveformMode::OFDM_COX);
+    bool use_control_profile = is_ofdm && isControlFrameBytes(frame_data);
+    Modulation tx_mod = use_control_profile ? Modulation::DQPSK : modulation_;
+    CodeRate tx_rate = use_control_profile ? CodeRate::R1_4 : code_rate_;
+
+    if (use_control_profile) {
+        LOG_MODEM(DEBUG, "[%s] OFDM control profile TX: %s %s",
+                  log_prefix_.c_str(), modulationToString(tx_mod), codeRateToString(tx_rate));
+        waveform_->configure(tx_mod, tx_rate);
+    }
+
+    // Encode frame bytes (LDPC + interleaving)
+    Bytes encoded = encodeFrameBytes(frame_data);
+
+    // Generate full preamble
+    Samples preamble = waveform_->generatePreamble();
+
+    // Modulate
+    Samples modulated = waveform_->modulate(encoded);
+
+    // Combine preamble + data
+    std::vector<float> result;
+    result.reserve(preamble.size() + modulated.size());
+    result.insert(result.end(), preamble.begin(), preamble.end());
+    result.insert(result.end(), modulated.begin(), modulated.end());
+
+    if (use_control_profile && (modulation_ != tx_mod || code_rate_ != tx_rate)) {
+        waveform_->configure(modulation_, code_rate_);
+    }
+
+    LOG_MODEM(INFO, "[%s] Encoded frame: %zu bytes -> %zu coded -> %zu samples",
+              log_prefix_.c_str(), frame_data.size(), encoded.size(), result.size());
+
+    return result;
+}
+
+std::vector<float> StreamingEncoder::encodeFrameLight(const Bytes& frame_data) {
+    if (!waveform_) {
+        LOG_MODEM(ERROR, "[%s] No waveform!", log_prefix_.c_str());
+        return {};
+    }
+
+    bool is_ofdm = (mode_ == protocol::WaveformMode::OFDM_CHIRP ||
+                    mode_ == protocol::WaveformMode::OFDM_COX);
+    bool use_control_profile = is_ofdm && isControlFrameBytes(frame_data);
+    Modulation tx_mod = use_control_profile ? Modulation::DQPSK : modulation_;
+    CodeRate tx_rate = use_control_profile ? CodeRate::R1_4 : code_rate_;
+
+    if (use_control_profile) {
+        LOG_MODEM(DEBUG, "[%s] OFDM control profile TX(light): %s %s",
+                  log_prefix_.c_str(), modulationToString(tx_mod), codeRateToString(tx_rate));
+        waveform_->configure(tx_mod, tx_rate);
+    }
+
+    // Encode frame bytes
+    Bytes encoded = encodeFrameBytes(frame_data);
+
+    // Generate light preamble if supported
+    Samples preamble;
+    if (waveform_->supportsDataPreamble()) {
+        preamble = waveform_->generateDataPreamble();
+    } else {
+        // Fall back to full preamble
+        preamble = waveform_->generatePreamble();
+    }
+
+    // Modulate
+    Samples modulated = waveform_->modulate(encoded);
+
+    // Combine
+    std::vector<float> result;
+    result.reserve(preamble.size() + modulated.size());
+    result.insert(result.end(), preamble.begin(), preamble.end());
+    result.insert(result.end(), modulated.begin(), modulated.end());
+
+    if (use_control_profile && (modulation_ != tx_mod || code_rate_ != tx_rate)) {
+        waveform_->configure(modulation_, code_rate_);
+    }
+
+    LOG_MODEM(DEBUG, "[%s] Encoded frame (light): %zu bytes -> %zu samples",
+              log_prefix_.c_str(), frame_data.size(), result.size());
+
+    return result;
+}
+
+std::vector<float> StreamingEncoder::encodeBurstLight(const std::vector<Bytes>& frame_data_list) {
+    if (frame_data_list.empty()) return {};
+    if (!waveform_) {
+        LOG_MODEM(ERROR, "[%s] No waveform!", log_prefix_.c_str());
+        return {};
+    }
+
+    // Single frame: just use normal encodeFrameLight
+    if (frame_data_list.size() == 1) {
+        return encodeFrameLight(frame_data_list[0]);
+    }
+
+    // Phase 1: LDPC encode all frames
+    std::vector<Bytes> encoded_frames;
+    for (const auto& fd : frame_data_list) {
+        encoded_frames.push_back(encodeFrameBytes(fd));
+    }
+
+    // Phase 2: Group into N-frame subgroups, burst-interleave each group
+    // Track which groups are burst-interleaved (for LTS marker)
+    const int BURST_GROUP_SIZE = std::max(2, burst_group_size_);
+    std::vector<bool> frame_is_group_start(encoded_frames.size(), false);
+
+    if (use_burst_interleave_) {
+        size_t full_groups = encoded_frames.size() / BURST_GROUP_SIZE;
+        for (size_t g = 0; g < full_groups; g++) {
+            size_t base = g * BURST_GROUP_SIZE;
+
+            // Extract the group
+            std::vector<Bytes> group(encoded_frames.begin() + base,
+                                     encoded_frames.begin() + base + BURST_GROUP_SIZE);
+
+            // Burst-interleave the coded bytes
+            auto interleaved = fec::BurstInterleaver::interleave(group);
+
+            // Replace in-place
+            for (int i = 0; i < BURST_GROUP_SIZE; i++) {
+                encoded_frames[base + i] = interleaved[i];
+            }
+            frame_is_group_start[base] = true;
+
+            LOG_MODEM(INFO, "[%s] Burst interleaved group %zu: frames %zu-%zu",
+                      log_prefix_.c_str(), g, base, base + BURST_GROUP_SIZE - 1);
+        }
+    }
+
+    // Phase 3: Modulate with preambles
+    std::vector<float> result;
+
+    for (size_t i = 0; i < encoded_frames.size(); i++) {
+        // Generate preamble (LTS training symbols)
+        Samples preamble;
+        if (i == 0) {
+            // First frame of burst: LTS data preamble
+            preamble = waveform_->supportsDataPreamble()
+                ? waveform_->generateDataPreamble()
+                : waveform_->generatePreamble();
+        } else {
+            // All subsequent frames: LTS data preamble
+            preamble = waveform_->generateDataPreamble();
+        }
+
+        // Negate first LTS symbol for burst-interleaved group starts
+        if (frame_is_group_start[i] && !preamble.empty()) {
+            // LTS preamble = 2 identical symbols. Negate the first one.
+            // detectDataSync() correlates sym[n] with sym[n+L]:
+            //   Normal: P_real > 0 (same signs multiply to positive)
+            //   Negated: P_real < 0 (opposite signs multiply to negative)
+            // abs() ensures detection still works; sign indicates burst marker.
+            size_t lts_sym_len = preamble.size() / 2;  // Half = one LTS symbol
+            for (size_t j = 0; j < lts_sym_len; j++) {
+                preamble[j] = -preamble[j];
+            }
+            LOG_MODEM(INFO, "[%s] LTS marker: negated first symbol for frame %zu (group start)",
+                      log_prefix_.c_str(), i);
+        }
+
+        // Modulate data
+        Samples modulated = waveform_->modulate(encoded_frames[i]);
+
+        result.insert(result.end(), preamble.begin(), preamble.end());
+        result.insert(result.end(), modulated.begin(), modulated.end());
+    }
+
+    LOG_MODEM(INFO, "[%s] Encoded burst: %zu blocks -> %zu samples (burst_interleave=%s)",
+              log_prefix_.c_str(), frame_data_list.size(), result.size(),
+              use_burst_interleave_ ? "yes" : "no");
+
+    return result;
+}
+
+std::vector<float> StreamingEncoder::encodePing() {
+    // PING is just the preamble with no data
+    // Always use MC-DPSK waveform for PING
+    if (!control_waveform_) {
+        control_waveform_ = WaveformFactory::createMCDPSK(mc_dpsk_carriers_);
+        // Apply spreading mode to new control waveform
+        if (spreading_mode_ != SpreadingMode::NONE) {
+            auto* mc_dpsk = dynamic_cast<MCDPSKWaveform*>(control_waveform_.get());
+            if (mc_dpsk) {
+                mc_dpsk->setSpreadingMode(spreading_mode_);
+            }
+        }
+    }
+
+    if (css_enabled_ && css_sync_) {
+        // CSS mode: [full legacy preamble] + [CSS PING chirp]
+        // Legacy preamble (up+down chirp) enables ChirpSync detection
+        // CSS chirp enables frame-type identification (replaces energy-ratio check)
+
+        auto legacy_preamble = control_waveform_->generatePreamble();  // [up][gap][down][gap]
+
+        // Get CSS band-limited chirp for PING (identifies frame type)
+        auto css_chirp = css_sync_->generatePreamble(sync::CSSFrameType::PING);
+
+        // Build hybrid preamble: [up][gap][down][gap][CSS-chirp]
+        std::vector<float> result;
+        result.reserve(legacy_preamble.size() + css_chirp.size());
+        result.insert(result.end(), legacy_preamble.begin(), legacy_preamble.end());
+        result.insert(result.end(), css_chirp.begin(), css_chirp.end());
+
+        LOG_MODEM(INFO, "[%s] PING: CSS mode, %zu samples (legacy=%zu + css=%zu)",
+                  log_prefix_.c_str(), result.size(), legacy_preamble.size(), css_chirp.size());
+        return result;
+    }
+
+    // Legacy mode: standard chirp preamble
+    auto preamble = control_waveform_->generatePreamble();
+    return std::vector<float>(preamble.begin(), preamble.end());
+}
+
+std::vector<float> StreamingEncoder::encodePong() {
+    // PONG is like PING but with different CSS frame type
+    if (!control_waveform_) {
+        control_waveform_ = WaveformFactory::createMCDPSK(mc_dpsk_carriers_);
+        // Apply spreading mode to new control waveform
+        if (spreading_mode_ != SpreadingMode::NONE) {
+            auto* mc_dpsk = dynamic_cast<MCDPSKWaveform*>(control_waveform_.get());
+            if (mc_dpsk) {
+                mc_dpsk->setSpreadingMode(spreading_mode_);
+            }
+        }
+    }
+
+    if (css_enabled_ && css_sync_) {
+        // CSS mode: [full legacy preamble] + [CSS PONG chirp]
+        auto legacy_preamble = control_waveform_->generatePreamble();
+        auto css_chirp = css_sync_->generatePreamble(sync::CSSFrameType::PONG);
+
+        std::vector<float> result;
+        result.reserve(legacy_preamble.size() + css_chirp.size());
+        result.insert(result.end(), legacy_preamble.begin(), legacy_preamble.end());
+        result.insert(result.end(), css_chirp.begin(), css_chirp.end());
+
+        LOG_MODEM(INFO, "[%s] PONG: CSS mode, %zu samples (legacy=%zu + css=%zu)",
+                  log_prefix_.c_str(), result.size(), legacy_preamble.size(), css_chirp.size());
+        return result;
+    }
+
+    // Legacy mode: PONG is identical to PING (context determines meaning)
+    auto preamble = control_waveform_->generatePreamble();
+    return std::vector<float>(preamble.begin(), preamble.end());
+}
+
+std::vector<float> StreamingEncoder::encodeBeacon(const Bytes& frame_data) {
+    // Beacon/CQ uses MC-DPSK control waveform with CHIRP preamble
+    // Always uses 4x spreading for maximum range (like PING/PONG/CONNECT)
+    if (frame_data.empty()) {
+        LOG_MODEM(WARN, "[%s] encodeBeacon: Empty frame data", log_prefix_.c_str());
+        return {};
+    }
+
+    // Ensure control waveform exists (MC-DPSK)
+    if (!control_waveform_) {
+        control_waveform_ = WaveformFactory::createMCDPSK(mc_dpsk_carriers_);
+        // Apply spreading mode to new control waveform
+        if (spreading_mode_ != SpreadingMode::NONE) {
+            auto* mc_dpsk = dynamic_cast<MCDPSKWaveform*>(control_waveform_.get());
+            if (mc_dpsk) {
+                mc_dpsk->setSpreadingMode(spreading_mode_);
+            }
+        }
+    }
+
+    // Force 4x spreading for beacon (maximum range)
+    auto* mc_dpsk = dynamic_cast<MCDPSKWaveform*>(control_waveform_.get());
+    SpreadingMode original_spreading = SpreadingMode::NONE;
+    if (mc_dpsk) {
+        original_spreading = mc_dpsk->getSpreadingMode();
+        mc_dpsk->setSpreadingMode(SpreadingMode::TIME_4X);
+    }
+
+    // Configure for DBPSK R1/4 (most robust)
+    control_waveform_->configure(Modulation::DBPSK, CodeRate::R1_4);
+
+    // Encode beacon frame with LDPC (simple variable-CW encoding like MC-DPSK control frames)
+    auto cws = v2::encodeFrameWithLDPC(frame_data, CodeRate::R1_4);
+    Bytes encoded;
+    for (const auto& cw : cws) {
+        encoded.insert(encoded.end(), cw.begin(), cw.end());
+    }
+
+    // Generate CHIRP preamble (1200ms for ±50 Hz CFO acquisition)
+    Samples preamble = control_waveform_->generatePreamble();
+
+    // Modulate with MC-DPSK
+    Samples modulated = control_waveform_->modulate(encoded);
+
+    // Combine preamble + data
+    std::vector<float> result;
+    result.reserve(preamble.size() + modulated.size());
+    result.insert(result.end(), preamble.begin(), preamble.end());
+    result.insert(result.end(), modulated.begin(), modulated.end());
+
+    // Restore original spreading mode
+    if (mc_dpsk) {
+        mc_dpsk->setSpreadingMode(original_spreading);
+    }
+
+    LOG_MODEM(INFO, "[%s] BEACON: %zu bytes -> %zu CWs -> %zu samples (CHIRP + 4x spreading)",
+              log_prefix_.c_str(), frame_data.size(), cws.size(), result.size());
+
+    return result;
+}
+
+std::vector<float> StreamingEncoder::encodeDataOnly(const Bytes& frame_data) {
+    if (!waveform_) {
+        LOG_MODEM(ERROR, "[%s] No waveform!", log_prefix_.c_str());
+        return {};
+    }
+
+    // Encode and modulate without preamble
+    Bytes encoded = encodeFrameBytes(frame_data);
+    Samples modulated = waveform_->modulate(encoded);
+
+    return std::vector<float>(modulated.begin(), modulated.end());
+}
+
+// ============================================================================
+// CONFIGURATION ACCESS
+// ============================================================================
+
+EncoderConfig StreamingEncoder::getConfig() const {
+    EncoderConfig cfg;
+    cfg.mode = mode_;
+    cfg.modulation = modulation_;
+    cfg.code_rate = code_rate_;
+    cfg.num_carriers = ofdm_config_.num_carriers;
+    cfg.data_carriers = calculateDataCarriers();
+    cfg.bits_per_symbol = cfg.data_carriers * getBitsPerSymbol(modulation_);
+    cfg.use_pilots = ofdm_config_.use_pilots;
+    cfg.pilot_spacing = ofdm_config_.pilot_spacing;
+    cfg.use_channel_interleave = use_channel_interleave_;
+    cfg.use_frame_interleave = use_frame_interleave_;
+    return cfg;
+}
+
+std::string StreamingEncoder::verifyConfigMatch(const EncoderConfig& other) const {
+    auto mine = getConfig();
+    std::string mismatches;
+
+    if (mine.mode != other.mode) {
+        mismatches += "mode mismatch; ";
+    }
+    if (mine.modulation != other.modulation) {
+        mismatches += "modulation mismatch; ";
+    }
+    if (mine.code_rate != other.code_rate) {
+        mismatches += "code_rate mismatch; ";
+    }
+    if (mine.num_carriers != other.num_carriers) {
+        char buf[64];
+        snprintf(buf, sizeof(buf), "num_carriers: TX=%d RX=%d; ",
+                 mine.num_carriers, other.num_carriers);
+        mismatches += buf;
+    }
+    if (mine.data_carriers != other.data_carriers) {
+        char buf[64];
+        snprintf(buf, sizeof(buf), "data_carriers: TX=%d RX=%d; ",
+                 mine.data_carriers, other.data_carriers);
+        mismatches += buf;
+    }
+    if (mine.bits_per_symbol != other.bits_per_symbol) {
+        char buf[64];
+        snprintf(buf, sizeof(buf), "bits_per_symbol: TX=%d RX=%d; ",
+                 mine.bits_per_symbol, other.bits_per_symbol);
+        mismatches += buf;
+    }
+    if (mine.use_pilots != other.use_pilots) {
+        mismatches += "use_pilots mismatch; ";
+    }
+    if (mine.pilot_spacing != other.pilot_spacing) {
+        char buf[64];
+        snprintf(buf, sizeof(buf), "pilot_spacing: TX=%d RX=%d; ",
+                 mine.pilot_spacing, other.pilot_spacing);
+        mismatches += buf;
+    }
+    if (mine.use_channel_interleave != other.use_channel_interleave) {
+        char buf[64];
+        snprintf(buf, sizeof(buf), "channel_interleave: TX=%s RX=%s; ",
+                 mine.use_channel_interleave ? "yes" : "no",
+                 other.use_channel_interleave ? "yes" : "no");
+        mismatches += buf;
+    }
+    if (mine.use_frame_interleave != other.use_frame_interleave) {
+        mismatches += "frame_interleave mismatch; ";
+    }
+
+    return mismatches;
+}
+
+// ============================================================================
+// INTERNAL HELPERS
+// ============================================================================
+
+void StreamingEncoder::createWaveform() {
+    startupTrace("StreamingEncoder", "create-waveform-internal-enter");
+
+    // Always have MC-DPSK ready for control frames
+    if (!control_waveform_) {
+        startupTrace("StreamingEncoder", "create-control-waveform-enter");
+        control_waveform_ = WaveformFactory::createMCDPSK(mc_dpsk_carriers_);
+        // Apply spreading mode to control waveform
+        if (spreading_mode_ != SpreadingMode::NONE && control_waveform_) {
+            auto* mc_dpsk = dynamic_cast<MCDPSKWaveform*>(control_waveform_.get());
+            if (mc_dpsk) {
+                mc_dpsk->setSpreadingMode(spreading_mode_);
+            }
+        }
+        startupTrace("StreamingEncoder", "create-control-waveform-exit");
+    }
+
+    switch (mode_) {
+        case protocol::WaveformMode::MC_DPSK:
+            startupTrace("StreamingEncoder", "create-main-waveform-mcdpsk-enter");
+            waveform_ = WaveformFactory::createMCDPSK(mc_dpsk_carriers_);
+            // CRITICAL: Configure with current modulation (DBPSK vs DQPSK)
+            // Without this, waveform defaults to DQPSK (2 bits/symbol)
+            waveform_->configure(modulation_, code_rate_);
+            // Apply spreading mode to main MC-DPSK waveform
+            if (spreading_mode_ != SpreadingMode::NONE && waveform_) {
+                auto* mc_dpsk = dynamic_cast<MCDPSKWaveform*>(waveform_.get());
+                if (mc_dpsk) {
+                    mc_dpsk->setSpreadingMode(spreading_mode_);
+                }
+            }
+            startupTrace("StreamingEncoder", "create-main-waveform-mcdpsk-exit");
+            break;
+
+        case protocol::WaveformMode::MFSK:
+            startupTrace("StreamingEncoder", "create-main-waveform-mfsk-enter");
+            waveform_ = std::make_unique<MFSKWaveform>();
+            waveform_->configure(modulation_, code_rate_);
+            startupTrace("StreamingEncoder", "create-main-waveform-mfsk-exit");
+            break;
+
+        case protocol::WaveformMode::OFDM_COX:
+            startupTrace("StreamingEncoder", "create-main-waveform-ofdm-cox-enter");
+            waveform_ = std::make_unique<OFDMNvisWaveform>(ofdm_config_);
+            static_cast<OFDMNvisWaveform*>(waveform_.get())->configure(
+                modulation_, code_rate_);
+            startupTrace("StreamingEncoder", "create-main-waveform-ofdm-cox-exit");
+            break;
+
+        case protocol::WaveformMode::OFDM_CHIRP:
+        default:
+            startupTrace("StreamingEncoder", "create-main-waveform-ofdm-chirp-enter");
+            waveform_ = std::make_unique<OFDMChirpWaveform>(ofdm_config_);
+            static_cast<OFDMChirpWaveform*>(waveform_.get())->configure(
+                modulation_, code_rate_);
+            startupTrace("StreamingEncoder", "create-main-waveform-ofdm-chirp-exit");
+            break;
+    }
+
+    // Sync pilot_spacing from waveform after configure()
+    // (coherent modes like QPSK use denser pilots than the config may specify)
+    if (waveform_) {
+        int spacing = waveform_->getPilotSpacing();
+        if (spacing > 0) ofdm_config_.pilot_spacing = spacing;
+    }
+
+    LOG_MODEM(DEBUG, "[%s] Created waveform: %s",
+              log_prefix_.c_str(), protocol::waveformModeToString(mode_));
+    startupTrace("StreamingEncoder", "create-waveform-internal-exit");
+}
+
+void StreamingEncoder::updateInterleaver() {
+    if (mode_ == protocol::WaveformMode::MC_DPSK) {
+        if (!use_mc_dpsk_channel_interleave_) {
+            channel_interleaver_.reset();
+            return;
+        }
+        int bits_per_symbol = mc_dpsk_carriers_ * getBitsPerSymbol(modulation_);
+        channel_interleaver_ = std::make_unique<ChannelInterleaver>(
+            bits_per_symbol, v2::LDPC_CODEWORD_BITS);
+        LOG_MODEM(INFO, "[%s] MC-DPSK channel interleaver: %d carriers × %d bits = %d bits/symbol",
+                  log_prefix_.c_str(), mc_dpsk_carriers_, getBitsPerSymbol(modulation_), bits_per_symbol);
+        return;
+    }
+
+    if (mode_ == protocol::WaveformMode::MFSK) {
+        channel_interleaver_.reset();
+        return;
+    }
+
+    // Calculate bits per OFDM symbol
+    int data_carriers = calculateDataCarriers();
+    int bits_per_carrier = getBitsPerSymbol(modulation_);
+    int bits_per_symbol = data_carriers * bits_per_carrier;
+
+    // Create channel interleaver
+    channel_interleaver_ = std::make_unique<ChannelInterleaver>(
+        bits_per_symbol, v2::LDPC_CODEWORD_BITS);
+
+    LOG_MODEM(INFO, "[%s] Channel interleaver: %d data carriers × %d bits = %d bits/symbol",
+              log_prefix_.c_str(), data_carriers, bits_per_carrier, bits_per_symbol);
+}
+
+int StreamingEncoder::calculateDataCarriers() const {
+    if (!ofdm_config_.use_pilots) {
+        return ofdm_config_.num_carriers;
+    }
+
+    // Calculate pilot count (same formula as modulator/demodulator)
+    int pilot_count = (ofdm_config_.num_carriers + ofdm_config_.pilot_spacing - 1)
+                      / ofdm_config_.pilot_spacing;
+    return ofdm_config_.num_carriers - pilot_count;
+}
+
+Bytes StreamingEncoder::encodeFrameBytes(const Bytes& frame_data) {
+    Bytes tx_data = frame_data;  // Mutable copy for header patching
+
+    bool is_ofdm = (mode_ == protocol::WaveformMode::OFDM_CHIRP ||
+                    mode_ == protocol::WaveformMode::OFDM_COX);
+
+    if (!is_ofdm) {
+        // MC-DPSK: Simple variable CW encoding (no frame interleaving)
+        // Control frames (20 bytes): ACK, NACK, etc. - encode as-is, no patching
+        // Data frames (>20 bytes): May need total_cw patching
+
+        // Check if this is a control frame (20 bytes, type 0x10-0x21 or 0x40)
+        bool is_control_frame = false;
+        if (tx_data.size() == 20 && tx_data.size() >= 3) {
+            uint8_t frame_type = tx_data[2];
+            // Control frame types: PROBE(0x10), PROBE_ACK(0x11), CONNECT(0x12),
+            // CONNECT_ACK(0x13), CONNECT_NAK(0x14), DISCONNECT(0x15), KEEPALIVE(0x16),
+            // MODE_CHANGE(0x17), ACK(0x20), NACK(0x21), BEACON(0x40)
+            is_control_frame = (frame_type >= 0x10 && frame_type <= 0x21) ||
+                               (frame_type == 0x40);
+        }
+
+        auto cws = v2::encodeFrameWithLDPC(tx_data, code_rate_);
+
+        // Only patch DATA frames (not control frames)
+        // DATA frames have total_cw at byte 12, header_crc at bytes 15-16
+        if (!is_control_frame && tx_data.size() >= 17) {
+            uint8_t actual_cw = static_cast<uint8_t>(cws.size());
+            if (tx_data[12] != actual_cw) {
+                LOG_MODEM(DEBUG, "[%s] Patching total_cw %d -> %d",
+                          log_prefix_.c_str(), tx_data[12], actual_cw);
+                tx_data[12] = actual_cw;
+                // Recalculate header CRC (over first 15 bytes for DATA frames)
+                uint16_t hcrc = v2::ControlFrame::calculateCRC(tx_data.data(), 15);
+                tx_data[15] = (hcrc >> 8) & 0xFF;
+                tx_data[16] = hcrc & 0xFF;
+                // Recalculate frame CRC (covers patched bytes 12, 15-16)
+                if (tx_data.size() >= v2::DataFrame::HEADER_SIZE + v2::DataFrame::CRC_SIZE) {
+                    uint16_t fcrc = v2::ControlFrame::calculateCRC(tx_data.data(), tx_data.size() - 2);
+                    tx_data[tx_data.size() - 2] = (fcrc >> 8) & 0xFF;
+                    tx_data[tx_data.size() - 1] = fcrc & 0xFF;
+                }
+                // Re-encode with corrected header and frame CRC
+                cws = v2::encodeFrameWithLDPC(tx_data, code_rate_);
+            }
+        }
+
+        bool apply_mc_dpsk_channel_interleave =
+            (mode_ == protocol::WaveformMode::MC_DPSK) &&
+            !is_control_frame &&
+            use_mc_dpsk_channel_interleave_ &&
+            static_cast<bool>(channel_interleaver_);
+        if (apply_mc_dpsk_channel_interleave) {
+            for (auto& cw : cws) {
+                cw = channel_interleaver_->interleave(cw);
+            }
+        }
+
+        // Concatenate codewords
+        Bytes encoded;
+        for (const auto& cw : cws) {
+            encoded.insert(encoded.end(), cw.begin(), cw.end());
+        }
+
+        LOG_MODEM(DEBUG, "[%s] MC-DPSK: %zu bytes -> %zu CWs (%zu coded, control=%s, ch_interleave=%s)",
+                  log_prefix_.c_str(), tx_data.size(), cws.size(), encoded.size(),
+                  is_control_frame ? "yes" : "no",
+                  apply_mc_dpsk_channel_interleave ? "yes" : "no");
+        return encoded;
+    }
+
+    // OFDM: Check if this is a control frame or data/connect frame
+    // Control frames (ACK, NACK, MODE_CHANGE, DISCONNECT, etc.) are 20 bytes = 1 CW, no interleaving
+    // Connect handshake frames are always MC-DPSK and do not reach this path.
+    // Data frames use 4-CW fixed frame encoding with frame interleaving
+    bool is_variable_cw_frame = false;
+    if (tx_data.size() >= 3) {
+        uint8_t frame_type = tx_data[2];
+        auto ft = static_cast<v2::FrameType>(frame_type);
+        if (v2::isControlFrame(ft)) {
+            is_variable_cw_frame = true;
+        }
+        // Non-control frames go through encodeFixedFrame() for 4-CW interleaving
+    }
+
+    if (is_variable_cw_frame) {
+        // Variable-CW encoding (no frame interleaving needed)
+        // Control frames = 1 CW
+        // Control frames always use R1/4: exact fit (20 bytes = 162 info bits / 8)
+        // and maximum LDPC redundancy for fading resilience
+        auto cws = v2::encodeFrameWithLDPC(tx_data, CodeRate::R1_4);
+        uint8_t actual_cw = static_cast<uint8_t>(cws.size());
+
+        // Patch total_cw for ConnectFrames (CONNECT, DISCONNECT, etc.)
+        // ConnectFrame::serialize() hardcodes total_cw=4 at byte 12, but actual
+        // encoding may produce fewer CWs (e.g. 2 at R1/2 for 44-byte ConnectFrame)
+        // ControlFrames (20 bytes) don't have total_cw field — parseHeader() returns 1
+        auto ft = static_cast<v2::FrameType>(tx_data[2]);
+        if (v2::isConnectFrame(ft) &&
+            tx_data.size() > v2::ControlFrame::SIZE &&
+            tx_data[12] != actual_cw) {
+            LOG_MODEM(INFO, "[%s] OFDM: Patching ConnectFrame total_cw %d -> %d",
+                      log_prefix_.c_str(), tx_data[12], actual_cw);
+            tx_data[12] = actual_cw;
+            // Recalculate header CRC (bytes 0..14 → CRC at 15-16)
+            uint16_t hcrc = v2::ControlFrame::calculateCRC(tx_data.data(), 15);
+            tx_data[15] = (hcrc >> 8) & 0xFF;
+            tx_data[16] = hcrc & 0xFF;
+            // Recalculate frame CRC (last 2 bytes cover everything before them)
+            size_t fcrc_offset = tx_data.size() - 2;
+            uint16_t fcrc = v2::ControlFrame::calculateCRC(tx_data.data(), fcrc_offset);
+            tx_data[fcrc_offset] = (fcrc >> 8) & 0xFF;
+            tx_data[fcrc_offset + 1] = fcrc & 0xFF;
+            // Re-encode with patched header
+            cws = v2::encodeFrameWithLDPC(tx_data, code_rate_);
+        }
+
+        Bytes encoded;
+        for (const auto& cw : cws) {
+            encoded.insert(encoded.end(), cw.begin(), cw.end());
+        }
+
+        LOG_MODEM(INFO, "[%s] OFDM control: %zu bytes -> %zu CW (%zu coded bytes), rate=R1/4 (hardened)",
+                  log_prefix_.c_str(), tx_data.size(), cws.size(), encoded.size());
+        return encoded;
+    }
+
+    // Data frames: 4-CW fixed frame encoding with frame interleaving
+    // Channel interleaving is controlled by use_channel_interleave_ flag
+    size_t bps = calculateDataCarriers() * getBitsPerSymbol(modulation_);
+    Bytes encoded = v2::encodeFixedFrame(tx_data, code_rate_, use_channel_interleave_, bps);
+
+    LOG_MODEM(DEBUG, "[%s] OFDM data: %zu bytes -> 4 CWs (%zu coded, frame_interleave=%s, channel_interleave=%s)",
+              log_prefix_.c_str(), tx_data.size(), encoded.size(),
+              use_frame_interleave_ ? "yes" : "no",
+              use_channel_interleave_ ? "yes" : "no");
+
+    return encoded;
+}
+
+} // namespace gui
+} // namespace ultra
