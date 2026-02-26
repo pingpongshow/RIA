@@ -1,6 +1,6 @@
 # RIA Modem License
 
-**Copyright (c) 2026 Stephen Packer. All Rights Reserved.**
+**Copyright (c) 2026 Stephen Packer, except for any code or technologies used in this code that is property of its respective owner. All Rights Reserved.**
 
 ---
 
@@ -40,6 +40,7 @@ This Software incorporates or implements various signal processing, coding, and 
 - Chirp spread spectrum synchronization
 - HARQ (Hybrid Automatic Repeat Request) with chase combining
 - Various modulation schemes (DPSK, QAM, etc.)
+- Fork of ProjectUltra modem
 
 **Third-party libraries included:**
 - Dear ImGui (MIT License) - See `thirdparty/imgui/LICENSE.txt`
