@@ -48,6 +48,8 @@ RIA Modem is a software modem that achieves reliable, high-speed data transfer o
 - **CLI Tools**: Frame-level transmit/receive for testing and debugging
 - **CAT Control**: Integrated PTT via Hamlib, Kenwood TCP, or serial
 
+- SEE THE RIACodex Companion app - Chat, BBS, APRS, Beacons, Weather, Email/Messaging, its a work in progress
+
 ---
 
 ## Performance
